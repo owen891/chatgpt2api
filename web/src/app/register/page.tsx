@@ -96,7 +96,18 @@ function normalizeConfig(value: RegisterConfig): RegisterConfig {
     max_consecutive_failures: Math.max(1, Number(value.max_consecutive_failures) || 10),
     max_runtime_minutes: Math.max(1, Number(value.max_runtime_minutes) || 60),
     retry_cooldown_seconds: Math.max(30, Number(value.retry_cooldown_seconds) || 300),
+    rate_limit_cooldown_seconds: Math.max(60, Number(value.rate_limit_cooldown_seconds) || 900),
     alert_webhook_url: String(value.alert_webhook_url || ""),
+  };
+}
+
+function mergeRuntimeSnapshot(current: RegisterConfig, next: RegisterConfig): RegisterConfig {
+  return {
+    ...current,
+    enabled: next.enabled,
+    stats: next.stats,
+    logs: next.logs,
+    history: next.history,
   };
 }
 
@@ -157,13 +168,17 @@ export default function RegisterPage() {
   const previousNewestLogRef = useRef("");
   const previousLogHeightRef = useRef(0);
 
-  const load = async () => {
+  const load = async (runtimeOnly = false) => {
     try {
       const data = await fetchRegisterConfig();
       const next = normalizeConfig(data.register);
-      setConfig(next);
-      setProviders(next.mail.providers || []);
-      setProxyMode(next.proxy === "direct" ? "direct" : next.proxy?.startsWith("group:") ? next.proxy : next.proxy ? "custom" : "default");
+      if (runtimeOnly) {
+        setConfig((current) => current ? mergeRuntimeSnapshot(current, next) : next);
+      } else {
+        setConfig(next);
+        setProviders(next.mail.providers || []);
+        setProxyMode(next.proxy === "direct" ? "direct" : next.proxy?.startsWith("group:") ? next.proxy : next.proxy ? "custom" : "default");
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "加载注册机配置失败");
     } finally {
@@ -177,7 +192,7 @@ export default function RegisterPage() {
   }, []);
   useEffect(() => {
     if (!config?.enabled) return;
-    const timer = window.setInterval(() => void load(), 2000);
+    const timer = window.setInterval(() => void load(true), 2000);
     return () => window.clearInterval(timer);
   }, [config?.enabled]);
   useEffect(() => {
@@ -214,8 +229,7 @@ export default function RegisterPage() {
           try {
             const raw = JSON.parse(event.data);
             const next = normalizeConfig(raw.register || raw);
-            setConfig(next);
-            setProviders(next.mail.providers || []);
+            setConfig((current) => current ? mergeRuntimeSnapshot(current, next) : next);
           } catch { /* 非法事件由下一次 SSE 或轮询覆盖。 */ }
         };
         nextSource.onerror = () => {
@@ -282,10 +296,7 @@ export default function RegisterPage() {
   const confirmedAvailable = Number(stats.current_available || 0);
   const pendingAvailable = Number(stats.unconfirmed_available || 0);
   const nextCheckAt = stats.next_check_at ? new Date(stats.next_check_at).getTime() : 0;
-  const nextCheckLimit = phase === "cooldown"
-    ? Math.max(30, Number(config?.retry_cooldown_seconds) || 300)
-    : Math.max(1, Number(config?.check_interval) || 5);
-  const nextCheckSeconds = nextCheckAt > now ? Math.min(nextCheckLimit, Math.ceil((nextCheckAt - now) / 1000)) : 0;
+  const nextCheckSeconds = nextCheckAt > now ? Math.ceil((nextCheckAt - now) / 1000) : 0;
   const showNextCheck = Boolean(config?.enabled && nextCheckAt && (phase === "monitoring" || phase === "cooldown"));
   const modeLabel = useMemo(() => ({ total: "注册总数", quota: "目标剩余额度", available: "目标可用账号" }[config?.mode || "total"] || "注册总数"), [config?.mode]);
   const targetSummary = config?.mode === "quota"
@@ -413,8 +424,6 @@ export default function RegisterPage() {
             <Field label="任务模式"><select disabled={running} value={config.mode} onChange={(event) => patch({ mode: event.target.value })} className="h-10 w-full rounded-md border border-stone-200 bg-white px-3 text-sm dark:border-white/10 dark:bg-stone-900"><option value="total">按注册总数</option><option value="quota">按目标剩余额度</option><option value="available">按目标可用账号</option></select></Field>
             <Field label={modeLabel}><Input disabled={running && config.mode === "total"} type="number" min="1" value={String(config.mode === "quota" ? config.target_quota : config.mode === "available" ? config.target_available : config.total)} onChange={(event) => patch(config.mode === "quota" ? { target_quota: Number(event.target.value) } : config.mode === "available" ? { target_available: Number(event.target.value) } : { total: Number(event.target.value) })} /></Field>
             <Field label="线程数"><Input disabled={running} type="number" min="1" value={String(config.threads)} onChange={(event) => patch({ threads: Number(event.target.value) })} /></Field>
-            {config.mode === "quota" ? <Field label="启动补池阈值"><Input disabled={false} type="number" min="0" value={String(config.trigger_quota)} onChange={(event) => patch({ trigger_quota: Number(event.target.value) })} /></Field> : null}
-            {config.mode === "available" ? <Field label="启动补池账号数"><Input disabled={false} type="number" min="0" value={String(config.trigger_available)} onChange={(event) => patch({ trigger_available: Number(event.target.value) })} /></Field> : null}
             {config.mode !== "total" ? <Field label="检查间隔（秒）"><Input disabled={false} type="number" min="1" value={String(config.check_interval)} onChange={(event) => patch({ check_interval: Number(event.target.value) })} /></Field> : null}
           <Field label="注册代理模式"><select disabled={running} value={proxyMode} onChange={(event) => changeProxyMode(event.target.value)} className="h-10 w-full rounded-md border border-stone-200 bg-white px-3 text-sm dark:border-white/10 dark:bg-stone-900"><option value="default">使用系统默认代理</option><option value="direct">直连</option>{proxyGroups.filter((group) => group.enabled !== false).map((group) => <option key={group.id} value={`group:${group.id}`}>代理组：{group.name}</option>)}<option value="custom">自定义地址</option></select></Field>
           {proxyMode === "custom" ? <Field label="自定义代理"><Input disabled={running} value={config.proxy || ""} onChange={(event) => patch({ proxy: event.target.value })} placeholder="http://127.0.0.1:7890" /></Field> : null}
@@ -424,6 +433,7 @@ export default function RegisterPage() {
             <Field label="连续失败上限"><Input disabled={running} type="number" min="1" value={String(config.max_consecutive_failures)} onChange={(event) => patch({ max_consecutive_failures: Number(event.target.value) })} /></Field>
             <Field label="最长运行（分钟）"><Input disabled={running} type="number" min="1" value={String(config.max_runtime_minutes)} onChange={(event) => patch({ max_runtime_minutes: Number(event.target.value) })} /></Field>
             <Field label="失败冷却（秒）"><Input disabled={running} type="number" min="30" value={String(config.retry_cooldown_seconds)} onChange={(event) => patch({ retry_cooldown_seconds: Number(event.target.value) })} /></Field>
+            <Field label="限流冷却（秒）"><Input disabled={running} type="number" min="60" value={String(config.rate_limit_cooldown_seconds)} onChange={(event) => patch({ rate_limit_cooldown_seconds: Number(event.target.value) })} /></Field>
             <Field label="单账号预估额度"><Input disabled={running} type="number" min="1" value={String(config.expected_quota_per_account)} onChange={(event) => patch({ expected_quota_per_account: Number(event.target.value) })} /></Field>
           </div>
           <div className="grid gap-3 sm:grid-cols-3">

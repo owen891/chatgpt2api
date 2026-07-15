@@ -161,7 +161,7 @@ def _provider_missing(provider: dict) -> list[str]:
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "trigger_quota": 50, "target_available": 10, "trigger_available": 5, "expected_quota_per_account": 25, "check_interval": 5, "max_attempts": 100, "max_consecutive_failures": 10, "max_runtime_minutes": 60, "retry_cooldown_seconds": 300, "alert_webhook_url": "", "enabled": False, "history": [], "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0, "phase": "stopped", "stop_reason": "", "last_check_at": "", "next_check_at": "", "channel_health": {}}}
+    return {**openai_register.config, "mode": "total", "target_quota": 100, "trigger_quota": 50, "target_available": 10, "trigger_available": 5, "expected_quota_per_account": 25, "check_interval": 5, "max_attempts": 100, "max_consecutive_failures": 10, "max_runtime_minutes": 60, "retry_cooldown_seconds": 300, "rate_limit_cooldown_seconds": 900, "alert_webhook_url": "", "enabled": False, "history": [], "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0, "phase": "stopped", "stop_reason": "", "last_check_at": "", "next_check_at": "", "channel_health": {}}}
 
 
 def _normalize(raw: dict) -> dict:
@@ -180,6 +180,7 @@ def _normalize(raw: dict) -> dict:
     cfg["max_consecutive_failures"] = max(1, int(cfg.get("max_consecutive_failures") or 10))
     cfg["max_runtime_minutes"] = max(1, int(cfg.get("max_runtime_minutes") or 60))
     cfg["retry_cooldown_seconds"] = max(30, int(cfg.get("retry_cooldown_seconds") or 300))
+    cfg["rate_limit_cooldown_seconds"] = max(60, int(cfg.get("rate_limit_cooldown_seconds") or 900))
     cfg["alert_webhook_url"] = str(cfg.get("alert_webhook_url") or "").strip()
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
@@ -513,21 +514,21 @@ class RegisterService:
         self._bump(**metrics, last_check_at=checked_at.isoformat())
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
-            refill_required = metrics["current_quota"] < int(cfg.get("trigger_quota") or 0)
-            signature = (mode, metrics["current_available"], metrics["current_quota"], int(cfg.get("trigger_quota") or 0), int(cfg.get("target_quota") or 1), reached, refill_required)
+            refill_required = not reached
+            signature = (mode, metrics["current_available"], metrics["current_quota"], int(cfg.get("target_quota") or 1), reached)
             if signature != self._last_pool_log_signature:
                 self._last_pool_log_signature = signature
                 action = "开始补池" if refill_required else "保持监控"
-                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，启动阈值={cfg.get('trigger_quota')}，目标额度={cfg.get('target_quota')}，{action}", "yellow")
+                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{action}", "yellow")
             return reached
         if mode == "available":
             reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            refill_required = metrics["current_available"] < int(cfg.get("trigger_available") or 0)
-            signature = (mode, metrics["current_available"], metrics["current_quota"], int(cfg.get("trigger_available") or 0), int(cfg.get("target_available") or 1), reached, refill_required)
+            refill_required = not reached
+            signature = (mode, metrics["current_available"], metrics["current_quota"], int(cfg.get("target_available") or 1), reached)
             if signature != self._last_pool_log_signature:
                 self._last_pool_log_signature = signature
                 action = "开始补池" if refill_required else "保持监控"
-                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，启动阈值={cfg.get('trigger_available')}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{action}", "yellow")
+                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{action}", "yellow")
             return reached
         return submitted >= int(cfg.get("total") or 1)
 
@@ -535,9 +536,9 @@ class RegisterService:
         stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
         mode = str(cfg.get("mode") or "total")
         if mode == "quota":
-            return int(stats.get("current_quota") or 0) < int(cfg.get("trigger_quota") or 0)
+            return int(stats.get("current_quota") or 0) < int(cfg.get("target_quota") or 1)
         if mode == "available":
-            return int(stats.get("current_available") or 0) < int(cfg.get("trigger_available") or 0)
+            return int(stats.get("current_available") or 0) < int(cfg.get("target_available") or 1)
         return True
 
     def _concurrency_limit(self, cfg: dict, threads: int) -> int:
@@ -563,7 +564,7 @@ class RegisterService:
             "start_quota": int(stats.get("current_quota") or 0),
             "start_available": int(stats.get("current_available") or 0),
             "target": int(cfg.get("target_quota") if mode == "quota" else cfg.get("target_available") or 0),
-            "trigger": int(cfg.get("trigger_quota") if mode == "quota" else cfg.get("trigger_available") or 0),
+            "trigger": int(cfg.get("target_quota") if mode == "quota" else cfg.get("target_available") or 0),
             "_success_start": success,
             "_fail_start": fail,
         }
@@ -589,6 +590,8 @@ class RegisterService:
             self._notify({"event": "register_refill_cycle_failed", **item})
 
     def _update_channel_health(self, result: dict) -> None:
+        if str(result.get("failure_kind") or "") == "rate_limit":
+            return
         payload = result.get("result") if isinstance(result.get("result"), dict) else {}
         provider = str(payload.get("register_provider") or result.get("provider") or "unknown").strip() or "unknown"
         with self._lock:
@@ -724,6 +727,8 @@ class RegisterService:
         retry_not_before = 0.0
         stop_reason = ""
         cycle_record: dict | None = None
+        cycle_block_reason = ""
+        cycle_block_cooldown = 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
@@ -769,10 +774,10 @@ class RegisterService:
                             cooldown_seconds = int(cfg.get("retry_cooldown_seconds") or 300)
                             retry_not_before = now + cooldown_seconds
                             cooldown_reason = f"{reason}，冷却后自动重试"
+                            self._schedule_next_check(cooldown_seconds)
                             if self._set_phase("cooldown", cooldown_reason):
                                 self._append_log(cooldown_reason, "yellow")
                             self._bump(running=0, done=done, success=success, fail=fail)
-                            self._schedule_next_check(cooldown_seconds)
                             self._wait_for_next_check(min(1.0, retry_not_before - now))
                             continue
                         stop_reason = reason
@@ -784,27 +789,31 @@ class RegisterService:
                     cycle_submitted = 0
                     cycle_consecutive_failures = 0
                     retry_not_before = 0.0
+                    cycle_block_reason = ""
+                    cycle_block_cooldown = 0
                     cycle_record = self._start_cycle_record(cfg, success, fail)
                     if self._set_phase("registering"):
                         self._append_log("检测到号池低于目标，开始自动补池", "yellow")
 
                 safety_submitted = cycle_submitted if monitor_mode else submitted
                 safety_started = (cycle_started_monotonic or now) if monitor_mode else runner_started_monotonic
-                safety_reason = self._safety_stop_reason(cfg, safety_submitted, cycle_consecutive_failures, safety_started)
+                safety_reason = cycle_block_reason or self._safety_stop_reason(cfg, safety_submitted, cycle_consecutive_failures, safety_started)
                 if enabled and safety_reason:
                     if monitor_mode:
                         if not futures:
-                            cooldown_seconds = int(cfg.get("retry_cooldown_seconds") or 300)
+                            cooldown_seconds = cycle_block_cooldown or int(cfg.get("retry_cooldown_seconds") or 300)
                             retry_not_before = now + cooldown_seconds
-                            reason = f"本轮补池暂停：{safety_reason}，冷却后自动重试"
+                            reason = f"本轮补池暂停：{safety_reason}，{cooldown_seconds} 秒后自动重试"
+                            self._schedule_next_check(cooldown_seconds)
                             if self._set_phase("cooldown", reason):
                                 self._append_log(reason, "yellow")
-                            self._schedule_next_check(cooldown_seconds)
                             self._finish_cycle_record(cycle_record, "cooldown", reason, success, fail)
                             cycle_record = None
                             cycle_submitted = 0
                             cycle_consecutive_failures = 0
                             cycle_started_monotonic = None
+                            cycle_block_reason = ""
+                            cycle_block_cooldown = 0
                             self._wait_for_next_check(min(1.0, retry_not_before - now))
                             continue
                     else:
@@ -854,6 +863,11 @@ class RegisterService:
                         else:
                             fail += 1
                             batch_failures += 1
+                            if str(result.get("failure_kind") or "") == "rate_limit" and not cycle_block_reason:
+                                retry_after = max(0, int(result.get("retry_after") or 0))
+                                configured_cooldown = int(cfg.get("rate_limit_cooldown_seconds") or 900)
+                                cycle_block_reason = "注册出口触发上游限流（HTTP 429）"
+                                cycle_block_cooldown = max(configured_cooldown, retry_after)
                     except Exception:
                         fail += 1
                         batch_failures += 1

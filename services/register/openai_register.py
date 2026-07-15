@@ -4,12 +4,14 @@ import base64
 import hashlib
 import json
 import random
+import re
 import secrets
 import string
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse
@@ -118,6 +120,57 @@ sec_ch_ua_full_version_list = DEFAULT_BROWSER_FINGERPRINT["sec_ch_ua_full_versio
 default_timeout = 30
 print_lock = threading.Lock()
 stats_lock = threading.Lock()
+
+
+class RegistrationHTTPError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int = 0, retry_after: int | None = None):
+        super().__init__(message)
+        self.status_code = max(0, int(status_code or 0))
+        self.retry_after = retry_after if retry_after is None else max(0, int(retry_after))
+        self.failure_kind = "rate_limit" if self.status_code == 429 else "http_error"
+
+
+def _retry_after_seconds(resp) -> int | None:
+    value = str(getattr(resp, "headers", {}).get("Retry-After") or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        return max(0, int(value))
+    try:
+        retry_at = parsedate_to_datetime(value)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        return max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds()))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _nonnegative_int(value: object) -> int | None:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _registration_failure_metadata(error: Exception) -> dict[str, object]:
+    message = str(error or "")
+    status_code = _nonnegative_int(getattr(error, "status_code", 0)) or 0
+    if not status_code:
+        match = re.search(r"(?:http_|status=)(\d{3})(?:\D|$)", message, flags=re.IGNORECASE)
+        if match:
+            status_code = int(match.group(1))
+    failure_kind = str(getattr(error, "failure_kind", "") or "").strip()
+    if status_code == 429 or "rate_limit_exceeded" in message.lower():
+        failure_kind = "rate_limit"
+        status_code = 429
+    retry_after = getattr(error, "retry_after", None)
+    result: dict[str, object] = {"failure_kind": failure_kind or "registration_error"}
+    if status_code:
+        result["status_code"] = status_code
+    parsed_retry_after = _nonnegative_int(retry_after)
+    if parsed_retry_after is not None:
+        result["retry_after"] = parsed_retry_after
+    return result
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
 
@@ -937,7 +990,11 @@ class PlatformRegistrar:
         resp, error = request_with_local_retry(self.session, "post", url, json={}, headers=headers, allow_redirects=False, verify=False)
         if resp is None or resp.status_code not in (200, 201, 204):
             detail = _response_json(resp) if resp is not None else {}
-            raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}, detail={json.dumps(detail, ensure_ascii=False)[:300]}")
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+            message = error or f"passwordless_send_otp_http_{status_code or 'unknown'}, detail={json.dumps(detail, ensure_ascii=False)[:300]}"
+            if status_code == 429:
+                raise RegistrationHTTPError(message, status_code=status_code, retry_after=_retry_after_seconds(resp))
+            raise RuntimeError(message)
 
     @staticmethod
     def _is_passwordless_invalid_state(resp) -> bool:
@@ -1024,7 +1081,11 @@ class PlatformRegistrar:
         if resp is None or resp.status_code not in (200, 201, 204):
             data = _response_json(resp) if resp is not None else {}
             detail = f", detail={json.dumps(data, ensure_ascii=False)[:300]}" if data else ""
-            raise RuntimeError(error or f"passwordless_send_otp_http_{getattr(resp, 'status_code', 'unknown')}{detail}")
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+            message = error or f"passwordless_send_otp_http_{status_code or 'unknown'}{detail}"
+            if status_code == 429:
+                raise RegistrationHTTPError(message, status_code=status_code, retry_after=_retry_after_seconds(resp))
+            raise RuntimeError(message)
         self.passwordless_signup = True
         step(index, "passwordless signup 验证码发送完成")
 
@@ -1269,6 +1330,13 @@ def worker(index: int) -> dict:
             stats["done"] += 1
             stats["fail"] += 1
         log(f"任务{index} 注册失败，本次耗时{cost:.1f}s，原因: {e}", "red")
-        return {"ok": False, "index": index, "error": str(e), "provider": registrar.provider_name, "provider_ref": registrar.provider_ref}
+        return {
+            "ok": False,
+            "index": index,
+            "error": str(e),
+            "provider": registrar.provider_name,
+            "provider_ref": registrar.provider_ref,
+            **_registration_failure_metadata(e),
+        }
     finally:
         registrar.close()

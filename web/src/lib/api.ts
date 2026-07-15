@@ -679,6 +679,7 @@ export type RegisterConfig = {
   max_consecutive_failures: number;
   max_runtime_minutes: number;
   retry_cooldown_seconds: number;
+  rate_limit_cooldown_seconds: number;
   alert_webhook_url: string;
   enabled: boolean;
   stats?: {

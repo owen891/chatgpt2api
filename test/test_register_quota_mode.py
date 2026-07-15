@@ -4,10 +4,12 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from api.register import _consume_event_ticket, _issue_event_ticket
+from services.register.openai_register import _registration_failure_metadata, _retry_after_seconds
 from services.register_service import RegisterService, _redact_register_log
 
 
@@ -123,16 +125,28 @@ class RegisterQuotaModeTests(unittest.TestCase):
             self.assertFalse(service._target_reached(config, submitted=0))
             self.assertEqual(len(service._logs), 2)
 
-    def test_refill_waits_until_trigger_threshold(self) -> None:
+    def test_refill_starts_whenever_quota_is_below_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = RegisterService(Path(tmp_dir) / "register.json")
             service._config.update({"mode": "quota", "target_quota": 100, "trigger_quota": 50})
             metrics = self._metrics(75)
             service._pool_metrics = lambda **_kwargs: dict(metrics)
+            self.assertTrue(service._refill_required(service.get()))
+
+            metrics.update(self._metrics(100))
             self.assertFalse(service._refill_required(service.get()))
 
-            metrics.update(self._metrics(49))
+    def test_refill_starts_whenever_available_accounts_are_below_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._config.update({"mode": "available", "target_available": 4, "trigger_available": 1})
+            metrics = self._metrics(75)
+            service._pool_metrics = lambda **_kwargs: dict(metrics)
+
             self.assertTrue(service._refill_required(service.get()))
+
+            metrics.update(self._metrics(100))
+            self.assertFalse(service._refill_required(service.get()))
 
     def test_concurrency_limit_uses_remaining_quota_gap(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -207,7 +221,7 @@ class RegisterQuotaModeTests(unittest.TestCase):
                 runner = threading.Thread(target=service._run, daemon=True)
                 service._runner = runner
                 runner.start()
-                self._wait_for(lambda: service._config["stats"].get("phase") == "cooldown")
+                self._wait_for(lambda: service._config["stats"].get("phase") == "cooldown" and bool(service._config["stats"].get("next_check_at")))
 
                 self.assertTrue(service._config["enabled"])
                 self.assertEqual(worker.call_count, 2)
@@ -244,6 +258,66 @@ class RegisterQuotaModeTests(unittest.TestCase):
                 runner.join(timeout=2)
 
             self.assertFalse(runner.is_alive())
+
+    def test_first_rate_limit_stops_replacement_submissions_and_enters_cooldown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config.update({
+                "enabled": True,
+                "mode": "quota",
+                "target_quota": 100,
+                "threads": 2,
+                "max_attempts": 100,
+                "max_consecutive_failures": 10,
+                "max_runtime_minutes": 5,
+                "retry_cooldown_seconds": 30,
+                "rate_limit_cooldown_seconds": 60,
+            })
+            result = {
+                "ok": False,
+                "error": "passwordless_send_otp_http_429",
+                "failure_kind": "rate_limit",
+                "status_code": 429,
+                "retry_after": 120,
+                "provider": "mail-a",
+            }
+
+            with patch("services.register_service.openai_register.worker", return_value=result) as worker:
+                runner = threading.Thread(target=service._run, daemon=True)
+                service._runner = runner
+                runner.start()
+                self._wait_for(lambda: service._config["stats"].get("phase") == "cooldown")
+
+                self.assertEqual(worker.call_count, 2)
+                self.assertIn("注册出口触发上游限流", service._config["stats"]["stop_reason"])
+                self.assertNotIn("mail-a", service._config["stats"].get("channel_health", {}))
+                next_check = datetime.fromisoformat(service._config["stats"]["next_check_at"])
+                self.assertGreaterEqual((next_check - datetime.now(timezone.utc)).total_seconds(), 115)
+                service.stop()
+                runner.join(timeout=2)
+
+            self.assertFalse(runner.is_alive())
+
+    def test_rate_limit_is_classified_from_legacy_error_text(self) -> None:
+        metadata = _registration_failure_metadata(
+            RuntimeError('passwordless_send_otp_http_429, detail={"code":"rate_limit_exceeded"}')
+        )
+
+        self.assertEqual(metadata["failure_kind"], "rate_limit")
+        self.assertEqual(metadata["status_code"], 429)
+
+    def test_failure_metadata_ignores_malformed_optional_numbers(self) -> None:
+        error = RuntimeError("registration failed")
+        error.status_code = "unknown"
+        error.retry_after = "later"
+
+        self.assertEqual(_registration_failure_metadata(error), {"failure_kind": "registration_error"})
+
+    def test_retry_after_seconds_accepts_delta_seconds(self) -> None:
+        response = type("Response", (), {"headers": {"Retry-After": "120"}})()
+
+        self.assertEqual(_retry_after_seconds(response), 120)
 
     def test_proxy_preflight_failure_enters_cooldown_without_counting_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

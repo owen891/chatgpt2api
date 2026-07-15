@@ -53,6 +53,7 @@ class RegisterConfigRequest(BaseModel):
     max_consecutive_failures: int | None = None
     max_runtime_minutes: int | None = None
     retry_cooldown_seconds: int | None = None
+    rate_limit_cooldown_seconds: int | None = None
     alert_webhook_url: str | None = None
 
 
