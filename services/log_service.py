@@ -235,6 +235,7 @@ class LoggedCall:
         try:
             result = await run_in_threadpool(handler, *args)
         except ImageGenerationError as exc:
+            self._record_image_archive_recovery(exc)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""),
                      image_upstream_attempts=getattr(exc, "image_upstream_attempts", None))
@@ -260,6 +261,7 @@ class LoggedCall:
         try:
             has_first, first = await run_in_threadpool(_next_item, result)
         except ImageGenerationError as exc:
+            self._record_image_archive_recovery(exc)
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""),
                      image_upstream_attempts=getattr(exc, "image_upstream_attempts", None))
@@ -276,6 +278,23 @@ class LoggedCall:
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
         return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
+
+    def _record_image_archive_recovery(self, exc: Exception) -> None:
+        if not self.endpoint.startswith("/v1/images") or not getattr(exc, "image_pending_archive", None):
+            return
+        try:
+            from services.image_archive_recovery_service import image_archive_recovery_service
+
+            recovery = image_archive_recovery_service.create(
+                self.identity,
+                operation="edit" if self.endpoint.endswith("/edits") else "generation",
+                model=self.model,
+                pending=getattr(exc, "image_pending_archive"),
+                error=str(exc),
+            )
+            setattr(exc, "pending_archive_id", str(recovery.get("id") or ""))
+        except Exception:
+            pass
 
     def stream(self, items):
         urls: list[str] = []
@@ -299,6 +318,7 @@ class LoggedCall:
                 yield _strip_internal_response_fields(item)
         except Exception as exc:
             failed = True
+            self._record_image_archive_recovery(exc)
             self.log(
                 "流式调用失败",
                 status="failed",

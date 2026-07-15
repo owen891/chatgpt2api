@@ -1,7 +1,7 @@
 "use client";
 
 import { memo, useEffect, useRef, useState } from "react";
-import { Clock3, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Square, Trash2 } from "lucide-react";
+import { Clock3, Copy, Download, EyeOff, LoaderCircle, RotateCcw, Sparkles, Square, Trash2 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -23,6 +23,8 @@ type ImageResultsProps = {
   onReuseTurnConfig: (conversationId: string, turnId: string) => void | Promise<void>;
   onRegenerateTurn: (conversationId: string, turnId: string) => void | Promise<void>;
   onRetryImage: (conversationId: string, turnId: string, imageId: string) => void | Promise<void>;
+  onRetryArchive: (conversationId: string, turnId: string, imageId: string) => void | Promise<void>;
+  onCopyArchiveSource: (conversationId: string, turnId: string, imageId: string) => void | Promise<void>;
   onCancelImage: (conversationId: string, turnId: string, imageId: string) => void | Promise<void>;
   onCancelTurn: (conversationId: string, turnId: string) => void | Promise<void>;
   onTimeoutRetryContinue: (taskId: string) => void | Promise<void>;
@@ -95,6 +97,8 @@ export function ImageResults({
   onReuseTurnConfig,
   onRegenerateTurn,
   onRetryImage,
+  onRetryArchive,
+  onCopyArchiveSource,
   onCancelImage,
   onCancelTurn,
   onTimeoutRetryContinue,
@@ -326,7 +330,9 @@ export function ImageResults({
                             >
                             <div className="flex h-full min-h-16 flex-col items-center justify-center gap-1.5 px-2 py-2 text-center text-[11px] leading-4 text-rose-600 sm:gap-3 sm:px-6 sm:py-8 sm:text-sm sm:leading-6">
                               <p className="font-medium">图片 {index + 1}/{turn.images.length}</p>
-                              <span className="line-clamp-2 sm:line-clamp-none">{image.error || "生成失败"}</span>
+                              <div className="max-h-32 w-full overflow-y-auto whitespace-pre-wrap break-words text-left" title={image.error || undefined}>
+                                {image.error || "生成失败"}
+                              </div>
                               <div className="flex items-center gap-2">
                                 {isTimeoutError && (
                                   <button
@@ -337,6 +343,25 @@ export function ImageResults({
                                     继续等待
                                   </button>
                                 )}
+                                {image.pendingArchive?.available && image.taskId ? (
+                                  <>
+                                    <button
+                                      type="button"
+                                      onClick={() => void onCopyArchiveSource(selectedConversation.id, turn.id, image.id)}
+                                      className="inline-flex items-center gap-1 rounded-full bg-sky-100 px-2 py-1 text-[10px] font-medium text-sky-700 shadow-sm transition hover:bg-sky-200 sm:px-3 sm:text-xs"
+                                    >
+                                      <Copy className="size-3" />
+                                      复制上游链接
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => void onRetryArchive(selectedConversation.id, turn.id, image.id)}
+                                      className="rounded-full bg-emerald-100 px-2 py-1 text-[10px] font-medium text-emerald-700 shadow-sm transition hover:bg-emerald-200 sm:px-3 sm:text-xs"
+                                    >
+                                      重新归档
+                                    </button>
+                                  </>
+                                ) : null}
                                 <button
                                   type="button"
                                   onClick={() => void onRetryImage(selectedConversation.id, turn.id, image.id)}

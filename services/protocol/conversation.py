@@ -44,6 +44,7 @@ class ImageGenerationError(Exception):
         self.param = param
         self.account_email = account_email
         self.conversation_id = conversation_id
+        self.pending_archive_id = ""
 
     def to_openai_error(self) -> dict[str, Any]:
         error_dict = {
@@ -56,6 +57,8 @@ class ImageGenerationError(Exception):
         }
         if self.account_email:
             error_dict["error"]["account_email"] = self.account_email
+        if self.pending_archive_id:
+            error_dict["error"]["pending_archive_id"] = self.pending_archive_id
         return error_dict
 
 

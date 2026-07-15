@@ -7,6 +7,7 @@ import mimetypes
 import ipaddress
 import re
 import socket
+import time
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
 from urllib.parse import unquote, unquote_to_bytes, urljoin, urlparse
@@ -23,6 +24,8 @@ ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
 MAX_IMAGE_REFERENCE_REDIRECTS = 3
+IMAGE_URL_FETCH_TIMEOUT_SECONDS = 180
+IMAGE_URL_FETCH_ATTEMPTS = 3
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
@@ -279,8 +282,8 @@ def _ensure_public_image_url(url: str) -> None:
             raise HTTPException(status_code=400, detail={"error": "image_url must not target local or private network addresses"})
 
 
-def _download_image_url(url: str) -> ImageInput:
-    """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
+def _download_image_url_once(url: str, session_kwargs: dict[str, object]) -> ImageInput:
+    """按指定网络路线下载一次远程图片。"""
     source = _clean(url)
     if source.startswith("data:"):
         return _decode_data_url(source)
@@ -292,12 +295,12 @@ def _download_image_url(url: str) -> ImageInput:
             response = requests.get(
                 request_url,
                 headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
-                timeout=60,
+                timeout=IMAGE_URL_FETCH_TIMEOUT_SECONDS,
                 allow_redirects=False,
-                **proxy_settings.build_session_kwargs(),
+                **session_kwargs,
             )
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
+        except Exception:
+            raise
         if response.status_code not in {301, 302, 303, 307, 308}:
             break
         location = _clean(response.headers.get("location"))
@@ -320,6 +323,57 @@ def _download_image_url(url: str) -> ImageInput:
         raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
     mime_type = _response_mime_type(response, parsed.path)
     return data, _filename_from_url(parsed.path, mime_type), mime_type
+
+
+def _image_download_routes() -> list[tuple[str, dict[str, object]]]:
+    """构造图片下载路线：直连失败后切换到资源代理。"""
+    routes: list[tuple[str, dict[str, object]]] = [("direct", {})]
+    resource_kwargs = proxy_settings.build_session_kwargs(resource=True, upstream=True)
+    if resource_kwargs.get("proxy"):
+        routes.append(("resource_proxy", resource_kwargs))
+    return routes
+
+
+def _is_non_retryable_image_error(detail: str) -> bool:
+    return any(
+        marker in detail
+        for marker in (
+            "must be an http or https URL",
+            "host could not be resolved",
+            "host returned an invalid address",
+            "must not target local or private network addresses",
+            "too many redirects",
+        )
+    )
+
+
+def _download_image_url(url: str) -> ImageInput:
+    """下载远程图片：超时、连接和上游响应失败时自动有限重试。"""
+    routes = _image_download_routes()
+    errors: list[str] = []
+    for attempt in range(IMAGE_URL_FETCH_ATTEMPTS):
+        route_name, session_kwargs = routes[attempt % len(routes)]
+        try:
+            return _download_image_url_once(url, session_kwargs)
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            if _is_non_retryable_image_error(detail):
+                raise
+            errors.append(f"{route_name}: {detail}")
+        except Exception as exc:
+            errors.append(f"{route_name}: {exc}")
+        if attempt + 1 < IMAGE_URL_FETCH_ATTEMPTS:
+            time.sleep(min(2 ** attempt, 4))
+    detail = errors[-1] if errors else "unknown fetch error"
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": (
+                f"image_url fetch failed after {IMAGE_URL_FETCH_ATTEMPTS} attempts "
+                f"(timeout={IMAGE_URL_FETCH_TIMEOUT_SECONDS}s): {detail}"
+            )
+        },
+    )
 
 
 def download_image_url(url: str) -> ImageInput:

@@ -21,6 +21,11 @@ export type StoredImage = {
   b64_json?: string;
   url?: string;
   revised_prompt?: string;
+  pendingArchive?: {
+    available: boolean;
+    count?: number;
+    channel_name?: string;
+  };
   error?: string;
   startTime?: number;
   elapsedSecs?: number;

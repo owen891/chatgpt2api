@@ -10,6 +10,7 @@ from typing import Any
 
 from services.config import DATA_DIR, config
 from services.content_filter import request_text
+from services.image_upstream_service import image_upstream_service
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.protocol import openai_v1_image_edit, openai_v1_image_generations
 
@@ -68,6 +69,28 @@ def _collect_image_urls(data: list[Any]) -> list[str]:
     return urls
 
 
+def _normalize_pending_archive(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        url = _clean(item.get("url"))
+        if not url:
+            continue
+        result.append({
+            "url": url,
+            "revised_prompt": _clean(item.get("revised_prompt")),
+            "channel_id": _clean(item.get("channel_id")),
+            "channel_name": _clean(item.get("channel_name")),
+            "operation": _clean(item.get("operation")),
+            "model": _clean(item.get("model")),
+            "base_url": _clean(item.get("base_url")),
+        })
+    return result
+
+
 def _public_task(task: dict[str, Any]) -> dict[str, Any]:
     item = {
         "id": task.get("id"),
@@ -87,6 +110,13 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         item["usage"] = task.get("usage")
     if task.get("error"):
         item["error"] = task.get("error")
+    pending = _normalize_pending_archive(task.get("pending_archive"))
+    if pending:
+        item["pending_archive"] = {
+            "available": True,
+            "count": len(pending),
+            "channel_name": pending[0].get("channel_name") or "",
+        }
     if task.get("progress"):
         item["progress"] = task.get("progress")
     if task.get("duration_ms") is not None:
@@ -143,7 +173,7 @@ class ImageTaskService:
             "n": 1,
             "size": size,
             "quality": quality,
-            "response_format": "url",
+            "response_format": "b64_json",
             "base_url": base_url,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="generate", payload=payload)
@@ -169,7 +199,7 @@ class ImageTaskService:
             "n": 1,
             "size": size,
             "quality": quality,
-            "response_format": "url",
+            "response_format": "b64_json",
             "base_url": base_url,
         }
         return self._submit(identity, client_task_id=client_task_id, mode="edit", payload=payload)
@@ -260,6 +290,7 @@ class ImageTaskService:
                 "model": _clean(payload.get("model"), "gpt-image-2"),
                 "size": _clean(payload.get("size")),
                 "quality": _clean(payload.get("quality"), "auto"),
+                "base_url": _clean(payload.get("base_url")),
                 "created_at": now,
                 "updated_at": now,
                 "created_ts": time.time(),
@@ -340,9 +371,11 @@ class ImageTaskService:
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            pending_archive = _normalize_pending_archive(getattr(exc, "image_pending_archive", None))
             duration_ms = int((time.time() - started) * 1000)
             if not self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                                      duration_ms=duration_ms,
+                                     pending_archive=pending_archive,
                                      **({"conversation_id": conversation_id} if conversation_id else {})):
                 return
             self._log_call(
@@ -357,6 +390,94 @@ class ImageTaskService:
                 account_email=account_email,
                 image_upstream_attempts=getattr(exc, "image_upstream_attempts", None),
                 image_upstream_selected=_clean(getattr(exc, "image_upstream_selected", "")),
+            )
+
+    def retry_archive(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        """重新归档已生成图片，不重新发起上游图片请求。"""
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            pending = _normalize_pending_archive(task.get("pending_archive"))
+            if not pending:
+                raise ValueError("task has no pending archive")
+            if task.get("status") in UNFINISHED_STATUSES:
+                raise ValueError("task is still running")
+            self._update_task(key, status=TASK_STATUS_RUNNING, error="正在重新归档图片", progress="archiving_image")
+            snapshot = _public_task(self._tasks[key])
+        thread = threading.Thread(
+            target=self._run_archive_retry,
+            args=(key, pending, identity),
+            name=f"image-archive-retry-{_clean(task_id)[:16]}",
+            daemon=True,
+        )
+        thread.start()
+        return snapshot
+
+    def pending_archive_sources(self, identity: dict[str, object], task_id: str) -> dict[str, Any]:
+        """返回当前用户任务的待归档上游 URL，供受保护的复制操作使用。"""
+        owner = _owner_id(identity)
+        key = _task_key(owner, _clean(task_id))
+        with self._lock:
+            task = self._tasks.get(key)
+            if task is None:
+                raise ValueError("task not found")
+            pending = _normalize_pending_archive(task.get("pending_archive"))
+            if not pending:
+                raise ValueError("task has no pending archive")
+            return {"task_id": task.get("id"), "items": pending}
+
+    def _run_archive_retry(
+        self,
+        key: str,
+        pending: list[dict[str, Any]],
+        identity: dict[str, object],
+    ) -> None:
+        started = time.time()
+        try:
+            with self._lock:
+                base_url = _clean(self._tasks.get(key, {}).get("base_url"))
+            result = image_upstream_service.archive_pending(pending, base_url=base_url)
+            if not self._update_task(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=result.get("data") or [],
+                error="",
+                pending_archive=[],
+                progress="",
+                duration_ms=int((time.time() - started) * 1000),
+            ):
+                return
+            self._log_call(
+                identity,
+                "edit" if str(pending[0].get("operation")) == "edit" else "generate",
+                _clean(pending[0].get("model"), "gpt-image-2"),
+                started,
+                "归档恢复完成",
+                urls=_collect_image_urls(result.get("data") or []),
+            )
+        except Exception as exc:
+            if self._is_cancelled(key):
+                return
+            message = str(exc) or "图片归档恢复失败"
+            self._update_task(
+                key,
+                status=TASK_STATUS_ERROR,
+                error=f"归档重试失败：{message}",
+                pending_archive=pending,
+                progress="",
+                duration_ms=int((time.time() - started) * 1000),
+            )
+            self._log_call(
+                identity,
+                "edit" if str(pending[0].get("operation")) == "edit" else "generate",
+                _clean(pending[0].get("model"), "gpt-image-2"),
+                started,
+                "归档恢复失败",
+                status="failed",
+                error=f"归档重试失败：{message}",
             )
 
     def _log_call(
@@ -418,6 +539,8 @@ class ImageTaskService:
             if task.get("status") == TASK_STATUS_CANCELLED and updates.get("status") != TASK_STATUS_CANCELLED:
                 return False
             task.update(updates)
+            if updates.get("pending_archive") == []:
+                task.pop("pending_archive", None)
             task["updated_at"] = _now_iso()
             task["updated_ts"] = time.time()
             self._save_locked()
@@ -452,6 +575,7 @@ class ImageTaskService:
                 "model": _clean(item.get("model"), "gpt-image-2"),
                 "size": _clean(item.get("size")),
                 "quality": _clean(item.get("quality"), "auto"),
+                "base_url": _clean(item.get("base_url")),
                 "created_at": _clean(item.get("created_at"), _now_iso()),
                 "updated_at": _clean(item.get("updated_at"), _clean(item.get("created_at"), _now_iso())),
                 "created_ts": item.get("created_ts"),
@@ -470,6 +594,9 @@ class ImageTaskService:
                 task["error"] = error
             if item.get("cancel_requested") is True:
                 task["cancel_requested"] = True
+            pending_archive = _normalize_pending_archive(item.get("pending_archive"))
+            if pending_archive:
+                task["pending_archive"] = pending_archive
             tasks[_task_key(owner, task_id)] = task
         return tasks
 

@@ -23,6 +23,8 @@ import {
   createImageGenerationTask,
   fetchModels,
   fetchImageTasks,
+  getPendingArchiveSources,
+  retryImageArchive,
   resumeImagePoll,
   type ImageModel,
   type Model,
@@ -222,6 +224,7 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       b64_json: first.b64_json,
       url: first.url,
       revised_prompt: first.revised_prompt,
+      pendingArchive: undefined,
       error: undefined,
       durationMs: task.duration_ms,
     };
@@ -234,6 +237,7 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       status: "error",
       taskStatus: undefined,
       progress: undefined,
+      pendingArchive: task.pending_archive,
       error: task.error || "生成失败",
       durationMs: task.duration_ms,
     };
@@ -266,6 +270,7 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
     status: "loading",
     taskStatus: newTaskStatus,
     progress: task.progress || image.progress,
+    pendingArchive: undefined,
     error: undefined,
     startTime,
     elapsedSecs,
@@ -276,6 +281,8 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
 function sleep(ms: number) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
+
+const ARCHIVE_RETRY_POLL_ATTEMPTS = 330;
 
 function pickFallbackConversationId(conversations: ImageConversation[]) {
   const activeConversation = conversations.find((conversation) =>
@@ -1435,6 +1442,74 @@ function ImagePageContent() {
     [runConversationQueue],
   );
 
+  const handleRetryArchive = useCallback(
+    async (conversationId: string, turnId: string, imageId: string) => {
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      const sourceTurn = conversation?.turns.find((item) => item.id === turnId);
+      const sourceImage = sourceTurn?.images.find((item) => item.id === imageId);
+      if (!conversation || !sourceTurn || !sourceImage?.taskId) return;
+      try {
+        const startedTask = await retryImageArchive(sourceImage.taskId);
+        await updateConversation(conversationId, (current) => {
+          const next = current ?? conversationsRef.current.find((item) => item.id === conversationId);
+          if (!next) return current!;
+          const currentTurn = next.turns.find((turn) => turn.id === turnId);
+          if (!currentTurn) return next;
+          const images = currentTurn.images.map((image) =>
+            image.id === imageId ? taskDataToStoredImage(image, startedTask) : image,
+          );
+          return {
+            ...next,
+            updatedAt: new Date().toISOString(),
+            turns: next.turns.map((turn) => turn.id === turnId
+              ? { ...turn, status: "generating" as const, error: undefined, images }
+              : turn),
+          };
+        });
+
+        for (let attempt = 0; attempt < ARCHIVE_RETRY_POLL_ATTEMPTS; attempt += 1) {
+          await sleep(2000);
+          const latest = await fetchImageTasks([sourceImage.taskId]);
+          const task = latest.items[0];
+          if (!task || task.status === "queued" || task.status === "running") continue;
+          await updateConversation(conversationId, (current) => {
+            const next = current ?? conversationsRef.current.find((item) => item.id === conversationId);
+            if (!next) return current!;
+            const turns = next.turns.map((turn) => {
+              if (turn.id !== turnId) return turn;
+              const images = turn.images.map((image) => image.id === imageId ? taskDataToStoredImage(image, task) : image);
+              return { ...turn, ...deriveTurnStatus({ ...turn, images }), images };
+            });
+            return { ...next, updatedAt: new Date().toISOString(), turns };
+          });
+          if (task.status === "success") toast.success("图片已重新归档");
+          break;
+        }
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "重新归档失败");
+      }
+    },
+    [updateConversation],
+  );
+
+  const handleCopyArchiveSource = useCallback(
+    async (conversationId: string, _turnId: string, imageId: string) => {
+      const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+      const image = conversation?.turns.flatMap((turn) => turn.images).find((item) => item.id === imageId);
+      if (!image?.taskId) return;
+      try {
+        const result = await getPendingArchiveSources(image.taskId);
+        const urls = result.items.map((item) => item.url).filter(Boolean);
+        if (!urls.length) throw new Error("没有可复制的上游链接");
+        await navigator.clipboard.writeText(urls.join("\n"));
+        toast.success("上游图片链接已复制");
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : "获取上游链接失败");
+      }
+    },
+    [],
+  );
+
   const cancelPendingImages = useCallback(
     async (conversationId: string, turnId: string, taskIds: string[]) => {
       const normalizedTaskIds = Array.from(new Set(taskIds.filter(Boolean)));
@@ -1791,6 +1866,8 @@ function ImagePageContent() {
                 onReuseTurnConfig={handleReuseTurnConfig}
                 onRegenerateTurn={handleRegenerateTurn}
                 onRetryImage={handleRetryImage}
+                onRetryArchive={handleRetryArchive}
+                onCopyArchiveSource={handleCopyArchiveSource}
                 onCancelImage={handleCancelImage}
                 onCancelTurn={handleCancelTurn}
                 onTimeoutRetryContinue={handleTimeoutRetryContinue}

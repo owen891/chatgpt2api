@@ -6,6 +6,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from services.image_task_service import ImageTaskService
 
@@ -234,6 +235,50 @@ class ImageTaskServiceTests(unittest.TestCase):
             task = reloaded.list_tasks(OWNER, ["persisted-cancelled"])["items"][0]
             self.assertEqual(task["status"], "cancelled")
             release.set()
+
+    def test_retry_archive_persists_and_does_not_call_generation_handler(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+            generation_calls = 0
+
+            def handler(_payload):
+                nonlocal generation_calls
+                generation_calls += 1
+                return {"data": [{"url": "http://example.test/generated.png"}]}
+
+            service = self.make_service(path, handler)
+            service._tasks["owner-1:archive-task"] = {
+                "id": "archive-task",
+                "owner_id": "owner-1",
+                "status": "error",
+                "mode": "generate",
+                "model": "gpt-image-2",
+                "size": "",
+                "quality": "auto",
+                "base_url": "https://public.example.test",
+                "created_at": "2026-01-01 00:00:00",
+                "updated_at": "2026-01-01 00:00:00",
+                "pending_archive": [{"url": "https://cdn.example.test/image.png", "operation": "generation", "model": "gpt-image-2"}],
+                "error": "图片归档下载失败",
+            }
+            service._save_locked()
+
+            with mock.patch.object(
+                __import__("services.image_task_service", fromlist=["image_upstream_service"]).image_upstream_service,
+                "archive_pending",
+                return_value={"data": [{"url": "http://app.test/images/recovered.png"}]},
+            ) as archive:
+                service.retry_archive(OWNER, "archive-task")
+                task = wait_for_task(service, OWNER, "archive-task", "success")
+
+            self.assertEqual(generation_calls, 0)
+            archive.assert_called_once()
+            self.assertEqual(archive.call_args.kwargs["base_url"], "https://public.example.test")
+            self.assertEqual(task["data"][0]["url"], "http://app.test/images/recovered.png")
+            self.assertNotIn("pending_archive", task)
+
+            reloaded = self.make_service(path, handler)
+            self.assertEqual(reloaded.list_tasks(OWNER, ["archive-task"])["items"][0]["status"], "success")
 
 
 if __name__ == "__main__":

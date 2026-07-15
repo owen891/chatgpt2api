@@ -353,6 +353,20 @@ export type ImageTask = {
   progress?: string;
   elapsed_secs?: number;
   duration_ms?: number;
+  pending_archive?: {
+    available: boolean;
+    count?: number;
+    channel_name?: string;
+  };
+};
+
+export type PendingArchiveItem = {
+  url: string;
+  revised_prompt?: string;
+  channel_id?: string;
+  channel_name?: string;
+  operation?: string;
+  model?: string;
 };
 
 type ImageTaskListResponse = {
@@ -579,6 +593,45 @@ export async function resumeImagePoll(taskId: string, extraTimeoutSecs = 30) {
     method: "POST",
     body: { extra_timeout_secs: extraTimeoutSecs },
   });
+}
+
+export async function retryImageArchive(taskId: string) {
+  return httpRequest<ImageTask>(`/api/image-tasks/${encodeURIComponent(taskId)}/retry-archive`, {
+    method: "POST",
+    body: {},
+  });
+}
+
+export async function getPendingArchiveSources(taskId: string) {
+  return httpRequest<{ task_id: string; items: PendingArchiveItem[] }>(
+    `/api/image-tasks/${encodeURIComponent(taskId)}/pending-archive`,
+  );
+}
+
+export type ImageArchiveRecovery = {
+  id: string;
+  status: "running" | "success" | "error";
+  operation?: string;
+  model?: string;
+  count: number;
+  error?: string | null;
+  data?: Array<{ url?: string; revised_prompt?: string }> | null;
+  pending_archive?: PendingArchiveItem[];
+  created_at: string;
+  updated_at: string;
+};
+
+export async function getImageArchiveRecovery(recoveryId: string) {
+  return httpRequest<ImageArchiveRecovery>(
+    `/api/image-archive-recoveries/${encodeURIComponent(recoveryId)}`,
+  );
+}
+
+export async function retryImageArchiveRecovery(recoveryId: string) {
+  return httpRequest<ImageArchiveRecovery>(
+    `/api/image-archive-recoveries/${encodeURIComponent(recoveryId)}/retry`,
+    { method: "POST", body: {} },
+  );
 }
 
 export async function fetchSettingsConfig() {

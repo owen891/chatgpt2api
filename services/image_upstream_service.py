@@ -134,6 +134,7 @@ class ImageUpstreamService:
         candidates = self._candidates(operation, model)
         max_attempts = int(self._settings().get("max_attempts") or 2)
         request_attempts = 0
+        last_archive_error: ImageGenerationError | None = None
         for channel, upstream_model in candidates:
             state = self._circuits.get(str(channel["id"]))
             if state and state.opened_until > time.time():
@@ -166,6 +167,27 @@ class ImageUpstreamService:
                     result = self._archive_response(response, body)
                 except ImageGenerationError as exc:
                     attempts.append(self._attempt(channel, operation, status, duration_ms, "archive_failed"))
+                    pending = getattr(exc, "pending_archive", None)
+                    if isinstance(pending, list):
+                        enriched = [
+                            {
+                                **item,
+                                "channel_id": str(channel.get("id") or ""),
+                                "channel_name": str(channel.get("name") or channel.get("id") or ""),
+                                "operation": operation,
+                                "model": model,
+                                "base_url": str(body.get("base_url") or ""),
+                            }
+                            for item in pending
+                            if isinstance(item, dict) and str(item.get("url") or "").strip()
+                        ]
+                        if enriched:
+                            last_archive_error = exc
+                            setattr(exc, "image_pending_archive", enriched)
+                            body["_image_pending_archive"] = enriched
+                            self._record_failure(channel, str(exc))
+                            if request_attempts < max_attempts:
+                                continue
                     body["_image_upstream_attempts"] = attempts
                     setattr(exc, "image_upstream_attempts", attempts)
                     raise
@@ -199,8 +221,35 @@ class ImageUpstreamService:
             error = ImageGenerationError(message, status_code=status, error_type="server_error", code="image_upstream_error")
             setattr(error, "image_upstream_attempts", attempts)
             raise error
+        if last_archive_error is not None:
+            body["_image_upstream_attempts"] = attempts
+            setattr(last_archive_error, "image_upstream_attempts", attempts)
+            raise last_archive_error
         body["_image_upstream_attempts"] = attempts
         return None
+
+    def archive_pending(self, pending: list[dict[str, object]], *, base_url: str = "") -> dict[str, Any]:
+        """重新下载并归档已生成的图片，不重新调用上游生图。"""
+        archived: list[dict[str, object]] = []
+        for item in pending:
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            downloader = self._downloader
+            if downloader is None:
+                from api.image_inputs import download_image_url
+
+                downloader = download_image_url
+            image_data, _, _ = downloader(url)
+            self._validate_image_data(image_data)
+            stored = self._storage.save(image_data, base_url or str(item.get("base_url") or "") or None)
+            result: dict[str, object] = {"url": stored.url}
+            if item.get("revised_prompt"):
+                result["revised_prompt"] = str(item["revised_prompt"])
+            archived.append(result)
+        if not archived:
+            raise ImageGenerationError("待归档图片不存在", status_code=400, code="pending_archive_empty")
+        return {"created": int(time.time()), "data": archived}
 
     def test_channel(self, channel: dict[str, object]) -> dict[str, object]:
         started = time.monotonic()
@@ -383,18 +432,49 @@ class ImageUpstreamService:
                 except (binascii.Error, ValueError) as exc:
                     raise ImageGenerationError("上游返回了无效的图片数据", status_code=502, code="invalid_upstream_response") from exc
             elif item.get("url"):
+                source_url = str(item["url"])
                 downloader = self._downloader
                 if downloader is None:
                     from api.image_inputs import download_image_url
 
                     downloader = download_image_url
-                image_data, _, _ = downloader(str(item["url"]))
+                try:
+                    image_data, _, _ = downloader(source_url)
+                except Exception as exc:
+                    error = ImageGenerationError(
+                        f"图片归档下载失败：{str(exc)[:500]}",
+                        status_code=502,
+                        error_type="server_error",
+                        code="image_archive_failed",
+                    )
+                    setattr(
+                        error,
+                        "pending_archive",
+                        [{"url": source_url, "revised_prompt": str(item.get("revised_prompt") or "")}],
+                    )
+                    raise error from exc
             else:
                 raise ImageGenerationError("上游图片响应缺少 url 或 b64_json", status_code=502, code="invalid_upstream_response")
             if not image_data:
                 raise ImageGenerationError("上游返回了空图片", status_code=502, code="invalid_upstream_response")
-            self._validate_image_data(image_data)
-            stored = self._storage.save(image_data, str(body.get("base_url") or "") or None)
+            try:
+                self._validate_image_data(image_data)
+                stored = self._storage.save(image_data, str(body.get("base_url") or "") or None)
+            except Exception as exc:
+                if item.get("url"):
+                    error = ImageGenerationError(
+                        f"图片归档保存失败：{str(exc)[:500]}",
+                        status_code=502,
+                        error_type="server_error",
+                        code="image_archive_failed",
+                    )
+                    setattr(
+                        error,
+                        "pending_archive",
+                        [{"url": str(item["url"]), "revised_prompt": str(item.get("revised_prompt") or "")}],
+                    )
+                    raise error from exc
+                raise
             result: dict[str, object] = {"url": stored.url}
             if item.get("revised_prompt"):
                 result["revised_prompt"] = str(item["revised_prompt"])

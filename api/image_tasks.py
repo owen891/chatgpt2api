@@ -8,6 +8,7 @@ from api.image_inputs import parse_image_edit_request, read_image_sources
 from api.support import require_identity, resolve_image_base_url
 from services.content_filter import check_request
 from services.image_task_service import image_task_service
+from services.image_archive_recovery_service import image_archive_recovery_service
 from services.log_service import LoggedCall
 
 
@@ -128,5 +129,49 @@ def create_router() -> APIRouter:
     ):
         identity = require_identity(authorization)
         return await run_in_threadpool(image_task_service.cancel_tasks, identity, body.task_ids)
+
+    @router.post("/api/image-tasks/{task_id}/retry-archive")
+    async def retry_image_archive(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.retry_archive, identity, task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.get("/api/image-tasks/{task_id}/pending-archive")
+    async def get_pending_archive_sources(
+        task_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_task_service.pending_archive_sources, identity, task_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+
+    @router.get("/api/image-archive-recoveries/{recovery_id}")
+    async def get_image_archive_recovery(
+        recovery_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_archive_recovery_service.get, identity, recovery_id, include_urls=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+
+    @router.post("/api/image-archive-recoveries/{recovery_id}/retry")
+    async def retry_image_archive_recovery(
+        recovery_id: str,
+        authorization: str | None = Header(default=None),
+    ):
+        identity = require_identity(authorization)
+        try:
+            return await run_in_threadpool(image_archive_recovery_service.retry, identity, recovery_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
     return router

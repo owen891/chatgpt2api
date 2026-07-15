@@ -128,6 +128,47 @@ class ImageUpstreamServiceTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
 
+    def test_url_archive_failure_preserves_pending_archive_context(self) -> None:
+        storage = FakeStorage()
+        service = ImageUpstreamService(
+            lambda: {"max_attempts": 1, "channels": [channel("first", 10)]},
+            storage=storage,
+            requester=lambda *_args, **_kwargs: response(200, {"data": [{"url": "https://cdn.example.test/image.png"}]}),
+            downloader=lambda _url: (_ for _ in ()).throw(RuntimeError("download timeout")),
+        )
+
+        with self.assertRaises(ImageGenerationError) as raised:
+            service.try_handle("generation", {"model": "gpt-image-2", "prompt": "test"})
+
+        self.assertEqual(raised.exception.code, "image_archive_failed")
+        pending = getattr(raised.exception, "image_pending_archive")
+        self.assertEqual(pending[0]["url"], "https://cdn.example.test/image.png")
+        self.assertEqual(pending[0]["channel_name"], "first")
+
+    def test_url_archive_failure_falls_back_to_next_channel(self) -> None:
+        service, storage, calls = self.make_service([
+            response(200, {"data": [{"url": "https://cdn.example.test/image.png"}]}),
+            response(200, {"data": [{"b64_json": base64.b64encode(PNG_BYTES).decode()}]}),
+        ])
+        service._downloader = lambda _url: (_ for _ in ()).throw(RuntimeError("download timeout"))
+
+        result = service.try_handle("generation", {"model": "gpt-image-2", "prompt": "test", "base_url": "http://app.test"})
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["json"]["model"], "first-model")
+        self.assertEqual(calls[1]["json"]["model"], "second-model")
+        self.assertEqual(storage.saved, [PNG_BYTES])
+        self.assertEqual(result["_image_upstream_selected"], "second")
+
+    def test_archive_pending_saves_without_calling_upstream(self) -> None:
+        service, storage, _calls = self.make_service([])
+        service._downloader = lambda _url: (PNG_BYTES, "image.png", "image/png")
+
+        result = service.archive_pending([{"url": "https://cdn.example.test/image.png"}], base_url="http://app.test")
+
+        self.assertEqual(result["data"][0]["url"], "http://app.test/images/1.png")
+        self.assertEqual(storage.saved, [PNG_BYTES])
+
     def test_pinned_channel_model_only_calls_the_selected_channel(self) -> None:
         service, _storage, calls = self.make_service([
             response(200, {"data": [{"b64_json": base64.b64encode(PNG_BYTES).decode()}]}),
