@@ -12,6 +12,15 @@ from services.register_service import RegisterService, _redact_register_log
 
 
 class RegisterQuotaModeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._proxy_preflight_patch = patch.object(
+            RegisterService,
+            "_proxy_preflight",
+            return_value={"ok": True, "skipped": True},
+        )
+        self._proxy_preflight_patch.start()
+        self.addCleanup(self._proxy_preflight_patch.stop)
+
     @staticmethod
     def _wait_for(predicate, timeout: float = 3.0) -> None:
         deadline = time.monotonic() + timeout
@@ -56,6 +65,48 @@ class RegisterQuotaModeTests(unittest.TestCase):
 
             metrics["current_quota"] = 100
             self.assertTrue(service._target_reached(config, submitted=4))
+
+    def test_pool_check_does_not_move_scheduled_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics(100)
+            service._config["stats"]["next_check_at"] = "2026-07-15T12:00:00+00:00"
+
+            service._target_reached({"mode": "quota", "target_quota": 100}, submitted=0)
+
+            self.assertEqual(service._config["stats"]["next_check_at"], "2026-07-15T12:00:00+00:00")
+
+    def test_pool_check_can_skip_stale_account_refresh_while_workers_are_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            calls: list[dict] = []
+
+            def metrics(**kwargs):
+                calls.append(kwargs)
+                return self._metrics(0)
+
+            service._pool_metrics = metrics
+            service._target_reached({"mode": "quota", "target_quota": 100}, submitted=0, refresh_stale=False)
+
+            self.assertEqual(len(calls), 1)
+            self.assertFalse(calls[0]["refresh_stale"])
+
+    def test_stopping_state_recovers_to_stopped_without_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config["enabled"] = False
+            service._config["stats"].update({
+                "phase": "stopping",
+                "running": 1,
+                "next_check_at": "2026-07-15T12:00:00+00:00",
+            })
+
+            snapshot = service.get()
+
+            self.assertEqual(snapshot["stats"]["phase"], "stopped")
+            self.assertEqual(snapshot["stats"]["running"], 0)
+            self.assertEqual(snapshot["stats"]["next_check_at"], "")
 
     def test_pool_check_log_only_changes_with_monitor_signature(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -166,6 +217,88 @@ class RegisterQuotaModeTests(unittest.TestCase):
 
             self.assertFalse(runner.is_alive())
             self.assertFalse(service._config["enabled"])
+
+    def test_concurrent_workers_do_not_exceed_failure_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config.update({
+                "enabled": True,
+                "mode": "quota",
+                "target_quota": 100,
+                "threads": 2,
+                "max_attempts": 100,
+                "max_consecutive_failures": 3,
+                "max_runtime_minutes": 5,
+                "retry_cooldown_seconds": 30,
+            })
+
+            with patch("services.register_service.openai_register.worker", return_value={"ok": False}) as worker:
+                runner = threading.Thread(target=service._run, daemon=True)
+                service._runner = runner
+                runner.start()
+                self._wait_for(lambda: service._config["stats"].get("phase") == "cooldown")
+
+                self.assertEqual(worker.call_count, 3)
+                service.stop()
+                runner.join(timeout=2)
+
+            self.assertFalse(runner.is_alive())
+
+    def test_proxy_preflight_failure_enters_cooldown_without_counting_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config.update({
+                "enabled": True,
+                "mode": "quota",
+                "target_quota": 100,
+                "threads": 3,
+                "max_attempts": 100,
+                "max_consecutive_failures": 10,
+                "max_runtime_minutes": 5,
+                "retry_cooldown_seconds": 30,
+            })
+
+            with (
+                patch.object(service, "_proxy_preflight", return_value={"ok": False, "error": "connection refused"}),
+                patch("services.register_service.openai_register.worker", return_value={"ok": True}) as worker,
+            ):
+                runner = threading.Thread(target=service._run, daemon=True)
+                service._runner = runner
+                runner.start()
+                self._wait_for(lambda: service._config["stats"].get("phase") == "cooldown")
+
+                self.assertEqual(worker.call_count, 0)
+                self.assertEqual(service._config["stats"]["done"], 0)
+                self.assertEqual(service._config["stats"]["fail"], 0)
+                self.assertIn("代理预检失败", service._config["stats"]["stop_reason"])
+                service.stop()
+                runner.join(timeout=2)
+
+            self.assertFalse(runner.is_alive())
+            self.assertFalse(service._config["enabled"])
+
+    def test_clearance_preflight_warning_does_not_block_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            self._proxy_preflight_patch.stop()
+            profile = type("Profile", (), {
+                "proxy_url": "http://proxy.example:8080",
+                "proxy_source": "runtime",
+                "clearance_mode": "flaresolverr",
+                "clearance": {"enabled": True},
+            })()
+            with (
+                patch("services.register_service.proxy_settings.get_profile", return_value=profile),
+                patch("services.register_service.test_proxy", return_value={"ok": True, "status": 200}),
+                patch("services.register_service.proxy_settings.refresh_clearance", return_value=None),
+            ):
+                result = service._proxy_preflight()
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["clearance_ok"])
+            self.assertIn("Cloudflare", result["clearance_warning"])
 
     def test_total_mode_does_not_submit_more_than_requested(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

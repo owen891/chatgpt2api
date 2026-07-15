@@ -77,15 +77,19 @@ function normalizeProvider(provider: RegisterProvider): RegisterProvider {
 }
 
 function normalizeConfig(value: RegisterConfig): RegisterConfig {
+  const targetQuota = Math.max(1, Number(value.target_quota) || 1);
+  const targetAvailable = Math.max(1, Number(value.target_available) || 1);
+  const rawTriggerQuota = Number(value.trigger_quota);
+  const rawTriggerAvailable = Number(value.trigger_available);
   return {
     ...value,
     mail: { ...(value.mail || {}), providers: (value.mail?.providers || []).map(normalizeProvider) },
     total: Math.max(1, Number(value.total) || 1),
     threads: Math.max(1, Number(value.threads) || 1),
-    target_quota: Math.max(1, Number(value.target_quota) || 1),
-    trigger_quota: Math.max(0, Math.min(Math.max(0, Number(value.target_quota) || 1) - 1, Number(value.trigger_quota) || Math.floor((Number(value.target_quota) || 1) / 2))),
-    target_available: Math.max(1, Number(value.target_available) || 1),
-    trigger_available: Math.max(0, Math.min(Math.max(0, Number(value.target_available) || 1) - 1, Number(value.trigger_available) || Math.floor((Number(value.target_available) || 1) / 2))),
+    target_quota: targetQuota,
+    trigger_quota: Math.max(0, Math.min(targetQuota - 1, Number.isFinite(rawTriggerQuota) ? rawTriggerQuota : Math.floor(targetQuota / 2))),
+    target_available: targetAvailable,
+    trigger_available: Math.max(0, Math.min(targetAvailable - 1, Number.isFinite(rawTriggerAvailable) ? rawTriggerAvailable : Math.floor(targetAvailable / 2))),
     expected_quota_per_account: Math.max(1, Number(value.expected_quota_per_account) || 25),
     check_interval: Math.max(1, Number(value.check_interval) || 5),
     max_attempts: Math.max(1, Number(value.max_attempts) || 100),
@@ -278,7 +282,11 @@ export default function RegisterPage() {
   const confirmedAvailable = Number(stats.current_available || 0);
   const pendingAvailable = Number(stats.unconfirmed_available || 0);
   const nextCheckAt = stats.next_check_at ? new Date(stats.next_check_at).getTime() : 0;
-  const nextCheckSeconds = nextCheckAt > now ? Math.ceil((nextCheckAt - now) / 1000) : 0;
+  const nextCheckLimit = phase === "cooldown"
+    ? Math.max(30, Number(config?.retry_cooldown_seconds) || 300)
+    : Math.max(1, Number(config?.check_interval) || 5);
+  const nextCheckSeconds = nextCheckAt > now ? Math.min(nextCheckLimit, Math.ceil((nextCheckAt - now) / 1000)) : 0;
+  const showNextCheck = Boolean(config?.enabled && nextCheckAt && (phase === "monitoring" || phase === "cooldown"));
   const modeLabel = useMemo(() => ({ total: "注册总数", quota: "目标剩余额度", available: "目标可用账号" }[config?.mode || "total"] || "注册总数"), [config?.mode]);
   const targetSummary = config?.mode === "quota"
     ? { label: "确认额度进度", value: `${confirmedQuota} / ${config.target_quota}` }
@@ -437,7 +445,7 @@ export default function RegisterPage() {
             <Button variant="outline" disabled={saving} onClick={() => void save()}>{saving ? <LoaderCircle className="animate-spin" /> : <Save />}保存</Button>
             <Button variant="outline" disabled={checking} onClick={() => void checkNow()}>{checking ? <LoaderCircle className="animate-spin" /> : <RefreshCw />}立即检查</Button>
           </div>
-          <div className="text-xs leading-5 text-stone-500">确认账号：{confirmedAvailable}，确认额度：{confirmedQuota}，缓存额度：{cachedQuota}，成功率：{Number(stats.success_rate || 0).toFixed(1)}%{nextCheckAt ? `，${nextCheckSeconds > 0 ? `下次检查 ${nextCheckSeconds} 秒后` : "等待检查"}` : ""}</div>
+          <div className="text-xs leading-5 text-stone-500">确认账号：{confirmedAvailable}，确认额度：{confirmedQuota}，缓存额度：{cachedQuota}，成功率：{Number(stats.success_rate || 0).toFixed(1)}%{showNextCheck ? `，${nextCheckSeconds > 0 ? `下次检查 ${nextCheckSeconds} 秒后` : "等待检查"}` : ""}</div>
           {stats.stop_reason ? <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">状态说明：{String(stats.stop_reason)}</div> : null}
           {Object.keys(stats.channel_health || {}).length ? <div className="space-y-1 border-t border-stone-100 pt-3 text-xs text-stone-500 dark:border-white/10"><div className="font-medium text-stone-700 dark:text-stone-200">邮箱渠道健康</div>{Object.entries(stats.channel_health || {}).map(([name, health]) => <div key={name} className="flex justify-between gap-3"><span className="truncate">{name}</span><span className="shrink-0 text-stone-400">成功 {health.success || 0} / 失败 {health.fail || 0}</span></div>)}</div> : null}
           {config.history?.length ? <div className="space-y-1 border-t border-stone-100 pt-3 text-xs text-stone-500 dark:border-white/10"><div className="font-medium text-stone-700 dark:text-stone-200">最近补池</div>{config.history.slice().reverse().slice(0, 3).map((item) => <div key={item.id} className="flex justify-between gap-3"><span>{item.status === "completed" ? "完成" : item.status === "cooldown" ? "冷却" : "停止"} · {item.success || 0} 成功 / {item.fail || 0} 失败</span><span className="shrink-0">{formatRegisterLogTime(item.finished_at)}</span></div>)}</div> : null}

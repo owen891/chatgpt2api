@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.json_file import read_json_object, write_json_file
+from services.proxy_service import proxy_settings, test_proxy
 from services.register import mail_provider, openai_register
 
 
@@ -217,11 +218,18 @@ class RegisterService:
     def get(self) -> dict:
         metrics = self._pool_metrics()
         with self._lock:
-            # 进程重启或任务线程异常退出后，不能把持久化的 enabled 当成运行中。
-            if self._config.get("enabled") and not (self._runner and self._runner.is_alive()):
+            runner_alive = bool(self._runner and self._runner.is_alive())
+            # 进程重启或任务线程异常退出后，不能把持久化状态当成运行中。
+            if self._config.get("enabled") and not runner_alive:
                 self._config["enabled"] = False
                 self._config["stats"]["running"] = 0
                 self._config["stats"]["phase"] = "stopped"
+                self._config["stats"]["next_check_at"] = ""
+                self._save()
+            elif not self._config.get("enabled") and not runner_alive and self._config["stats"].get("phase") == "stopping":
+                self._config["stats"]["running"] = 0
+                self._config["stats"]["phase"] = "stopped"
+                self._config["stats"]["next_check_at"] = ""
                 self._save()
             self._config["stats"].update(metrics)
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
@@ -397,6 +405,7 @@ class RegisterService:
         with self._lock:
             self._config["enabled"] = False
             self._config["stats"]["phase"] = "stopping"
+            self._config["stats"]["next_check_at"] = ""
             self._config["stats"]["updated_at"] = _now()
             self._save()
             self._wake_event.set()
@@ -493,16 +502,15 @@ class RegisterService:
             "pool_refresh_errors": [],
         }
 
-    def _target_reached(self, cfg: dict, submitted: int) -> bool:
+    def _target_reached(self, cfg: dict, submitted: int, *, refresh_stale: bool = True) -> bool:
         mode = str(cfg.get("mode") or "total")
         metrics = self._pool_metrics(
-            refresh_stale=mode in {"quota", "available"},
+            refresh_stale=refresh_stale and mode in {"quota", "available"},
             target_quota=int(cfg.get("target_quota") or 1) if mode == "quota" else None,
             target_available=int(cfg.get("target_available") or 1) if mode == "available" else None,
         )
         checked_at = datetime.now(timezone.utc)
-        next_check_at = checked_at + timedelta(seconds=max(1, int(cfg.get("check_interval") or 5)))
-        self._bump(**metrics, last_check_at=checked_at.isoformat(), next_check_at=next_check_at.isoformat())
+        self._bump(**metrics, last_check_at=checked_at.isoformat())
         if mode == "quota":
             reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
             refill_required = metrics["current_quota"] < int(cfg.get("trigger_quota") or 0)
@@ -644,6 +652,7 @@ class RegisterService:
             self._config["enabled"] = False
             self._config["stats"]["phase"] = "stopped"
             self._config["stats"]["stop_reason"] = reason
+            self._config["stats"]["next_check_at"] = ""
             self._config["stats"]["updated_at"] = _now()
             self._save()
         if reason:
@@ -655,14 +664,55 @@ class RegisterService:
             changed = stats.get("phase") != phase or str(stats.get("stop_reason") or "") != reason
             stats["phase"] = phase
             stats["stop_reason"] = reason
+            if phase not in {"monitoring", "cooldown"}:
+                stats["next_check_at"] = ""
             stats["updated_at"] = _now()
             if changed:
                 self._save()
             return changed
 
+    def _schedule_next_check(self, seconds: float) -> None:
+        delay = max(0.0, float(seconds))
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=delay)
+        self._bump(next_check_at=deadline.isoformat())
+
     def _wait_for_next_check(self, seconds: float) -> None:
         self._wake_event.wait(timeout=max(0.1, float(seconds)))
         self._wake_event.clear()
+
+    def _proxy_preflight(self) -> dict[str, object]:
+        register_proxy = str(self._config.get("proxy") or "").strip()
+        profile = proxy_settings.get_profile(proxy=register_proxy, upstream=True)
+        if not profile.proxy_url:
+            return {"ok": True, "skipped": True, "proxy_source": profile.proxy_source}
+        result = test_proxy(profile.proxy_url, timeout=10.0)
+        if not result.get("ok"):
+            return result
+        clearance = profile.clearance
+        if profile.clearance_mode == "flaresolverr":
+            bundle = proxy_settings.refresh_clearance(
+                target_url="https://auth.openai.com",
+                proxy=profile.proxy_url,
+                force=True,
+                upstream=True,
+            )
+            if bundle is None:
+                # FlareSolverr 在目标页没有挑战时可能返回 200 但不带 clearance。
+                # 代理本身可用时继续执行，由实际注册请求按需处理 403，避免整轮任务被误判为代理故障。
+                return {
+                    **result,
+                    "clearance_ok": False,
+                    "clearance_warning": "FlareSolverr 预检未返回 Cookie，将在请求遇到 Cloudflare 时按需重试",
+                    "proxy_source": profile.proxy_source,
+                    "clearance": clearance,
+                }
+            result = {
+                **result,
+                "clearance_ok": True,
+                "proxy_source": profile.proxy_source,
+                "clearance": clearance,
+            }
+        return result
 
     def _run(self) -> None:
         threads = int(self.get()["threads"])
@@ -681,9 +731,16 @@ class RegisterService:
                 enabled = bool(cfg.get("enabled"))
                 mode = str(cfg.get("mode") or "total")
                 monitor_mode = mode in {"quota", "available"}
-                reached = self._target_reached(cfg, submitted)
-                refill_required = self._refill_required(cfg) if monitor_mode else True
                 now = time.monotonic()
+
+                if monitor_mode and enabled and not futures and now < retry_not_before:
+                    current_reason = str((cfg.get("stats") or {}).get("stop_reason") or "本轮补池失败，等待重试")
+                    self._set_phase("cooldown", current_reason)
+                    self._wait_for_next_check(min(1.0, retry_not_before - now))
+                    continue
+
+                reached = self._target_reached(cfg, submitted, refresh_stale=not futures)
+                refill_required = self._refill_required(cfg) if monitor_mode else True
 
                 if monitor_mode and enabled and not futures:
                     cycle_active = cycle_started_monotonic is not None
@@ -697,15 +754,30 @@ class RegisterService:
                     if (not cycle_active and not refill_required) or reached:
                         if self._set_phase("monitoring"):
                             self._append_log("号池处于安全区间，进入常驻监控", "green")
+                        wait_seconds = int(cfg.get("check_interval") or 5)
                         self._bump(running=0, done=done, success=success, fail=fail)
-                        self._wait_for_next_check(int(cfg.get("check_interval") or 5))
+                        self._schedule_next_check(wait_seconds)
+                        self._wait_for_next_check(wait_seconds)
                         continue
 
-                if monitor_mode and enabled and not reached and not futures and now < retry_not_before:
-                    current_reason = str((cfg.get("stats") or {}).get("stop_reason") or "本轮补池失败，等待重试")
-                    self._set_phase("cooldown", current_reason)
-                    self._wait_for_next_check(min(1.0, retry_not_before - now))
-                    continue
+                if enabled and not reached and not futures and cycle_started_monotonic is None:
+                    proxy_check = self._proxy_preflight()
+                    if not proxy_check.get("ok"):
+                        error = _redact_register_log(proxy_check.get("error") or "代理不可用")
+                        reason = f"代理预检失败：{error}"
+                        if monitor_mode:
+                            cooldown_seconds = int(cfg.get("retry_cooldown_seconds") or 300)
+                            retry_not_before = now + cooldown_seconds
+                            cooldown_reason = f"{reason}，冷却后自动重试"
+                            if self._set_phase("cooldown", cooldown_reason):
+                                self._append_log(cooldown_reason, "yellow")
+                            self._bump(running=0, done=done, success=success, fail=fail)
+                            self._schedule_next_check(cooldown_seconds)
+                            self._wait_for_next_check(min(1.0, retry_not_before - now))
+                            continue
+                        stop_reason = reason
+                        self._finish_running_state(stop_reason)
+                        break
 
                 if monitor_mode and enabled and not reached and cycle_started_monotonic is None:
                     cycle_started_monotonic = now
@@ -722,10 +794,12 @@ class RegisterService:
                 if enabled and safety_reason:
                     if monitor_mode:
                         if not futures:
-                            retry_not_before = now + int(cfg.get("retry_cooldown_seconds") or 300)
+                            cooldown_seconds = int(cfg.get("retry_cooldown_seconds") or 300)
+                            retry_not_before = now + cooldown_seconds
                             reason = f"本轮补池暂停：{safety_reason}，冷却后自动重试"
                             if self._set_phase("cooldown", reason):
                                 self._append_log(reason, "yellow")
+                            self._schedule_next_check(cooldown_seconds)
                             self._finish_cycle_record(cycle_record, "cooldown", reason, success, fail)
                             cycle_record = None
                             cycle_submitted = 0
@@ -740,6 +814,8 @@ class RegisterService:
                 max_attempts = int(cfg.get("max_attempts") or 100)
                 attempt_count = cycle_submitted if monitor_mode else submitted
                 concurrency_limit = self._concurrency_limit(cfg, threads)
+                remaining_failure_budget = max(0, int(cfg.get("max_consecutive_failures") or 10) - cycle_consecutive_failures)
+                concurrency_limit = min(concurrency_limit, remaining_failure_budget)
                 while enabled and not reached and not safety_reason and len(futures) < concurrency_limit and attempt_count < max_attempts:
                     submitted += 1
                     if monitor_mode:
@@ -790,6 +866,7 @@ class RegisterService:
         with self._lock:
             self._config["enabled"] = False
             self._config["stats"]["phase"] = "stopped"
+            self._config["stats"]["next_check_at"] = ""
             if stop_reason:
                 self._config["stats"]["stop_reason"] = stop_reason
             self._save()
