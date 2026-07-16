@@ -12,6 +12,25 @@
     "warning"
   ],
   "proxy": "",
+  "proxy_groups": [
+    {
+      "id": "sample-group",
+      "name": "Sample Proxy Group",
+      "strategy": "request_random",
+      "rotation_interval_minutes": 0,
+      "enabled": true,
+      "notes": "",
+      "nodes": [
+        {
+          "id": "sample-node-1",
+          "name": "sample-node-1",
+          "url": "http://127.0.0.1:7890",
+          "enabled": true,
+          "image_concurrency_limit": 30
+        }
+      ]
+    }
+  ],
   "proxy_runtime": {
     "enabled": true,
     "egress_mode": "single_proxy",

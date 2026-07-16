@@ -27,6 +27,77 @@ const typeLabels: Record<string, string> = {
   [LogType.Account]: "账号管理日志",
 };
 
+const detailLabels: Record<string, string> = {
+  key_id: "密钥 ID",
+  key_name: "密钥名称",
+  role: "角色",
+  endpoint: "接口",
+  model: "模型",
+  started_at: "开始时间",
+  ended_at: "结束时间",
+  duration_ms: "耗时（毫秒）",
+  status: "状态",
+  request_text: "请求内容",
+  error: "错误信息",
+  urls: "图片地址",
+};
+
+const statusLabels: Record<string, string> = {
+  success: "成功",
+  failed: "失败",
+  running: "运行中",
+  queued: "排队中",
+  cancelled: "已取消",
+};
+
+function getDetailLabel(key: string) {
+  return detailLabels[key] || key;
+}
+
+function localizeErrorMessage(message: string) {
+  const normalized = message.replace(/\s+/g, " ").trim();
+  if (
+    normalized.includes("image_account_selection:unavailable")
+    && normalized.includes("no image account is ready")
+  ) {
+    return "图片账号选择失败：当前没有可用的图片账号";
+  }
+  return message;
+}
+
+function normalizeDetailValue(key: string, value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeDetailValue(key, item));
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([nestedKey, nestedValue]) => [
+        getDetailLabel(nestedKey),
+        normalizeDetailValue(nestedKey, nestedValue),
+      ]),
+    );
+  }
+  if (typeof value === "string") {
+    if (key === "status") {
+      return statusLabels[value] || value;
+    }
+    if (key === "error") {
+      return localizeErrorMessage(value);
+    }
+    return value;
+  }
+  return value;
+}
+
+function buildDisplayDetail(detail: Record<string, unknown> | undefined) {
+  return Object.fromEntries(
+    Object.entries(detail || {}).map(([key, value]) => [
+      getDetailLabel(key),
+      normalizeDetailValue(key, value),
+    ]),
+  );
+}
+
 function getDetailText(item: SystemLog, key: string) {
   const value = item.detail?.[key];
   return typeof value === "string" || typeof value === "number" ? String(value) : "-";
@@ -44,8 +115,7 @@ function getUrls(item: SystemLog | null) {
 
 function getStatus(item: SystemLog) {
   const status = item.detail?.status;
-  if (status === "success") return "成功";
-  if (status === "failed") return "失败";
+  if (typeof status === "string") return statusLabels[status] || status;
   return "-";
 }
 
@@ -65,6 +135,7 @@ function LogsContent() {
   const [deletingItems, setDeletingItems] = useState<SystemLog[]>([]);
   const detailUrls = getUrls(detailLog);
   const detailImages = detailUrls.map((url, index) => ({ id: `${index}`, src: url }));
+  const detailDisplay = useMemo(() => buildDisplayDetail(detailLog?.detail), [detailLog]);
   const isCallLog = type === LogType.Call;
   const pageSize = 10;
   const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
@@ -288,8 +359,10 @@ function LogsContent() {
                   .filter(([key, value]) => key !== "urls" && typeof value !== "object")
                   .map(([key, value]) => (
                     <div key={key} className="flex items-start justify-between gap-4">
-                      <span className="text-stone-400">{key}</span>
-                      <span className="text-right font-medium break-all text-stone-700">{String(value)}</span>
+                      <span className="text-stone-400">{getDetailLabel(key)}</span>
+                      <span className="break-all text-right font-medium text-stone-700">
+                        {String(normalizeDetailValue(key, value))}
+                      </span>
                     </div>
                   ))}
               </div>
@@ -311,7 +384,7 @@ function LogsContent() {
                 </div>
               ) : null}
               <pre className="max-h-[72vh] overflow-auto rounded-xl border border-stone-200 bg-stone-50 p-4 text-xs leading-6 text-stone-700">
-                {JSON.stringify(detailLog?.detail || {}, null, 2)}
+                {JSON.stringify(detailDisplay, null, 2)}
               </pre>
             </div>
           </div>

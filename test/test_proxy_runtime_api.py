@@ -175,6 +175,37 @@ class ProxyRuntimeApiTests(unittest.TestCase):
         self.assertEqual(payload["version"], "9.9.9-test")
         self.assertEqual(payload["proxy_runtime"]["clearance_mode"], "flaresolverr")
 
+    def test_proxy_group_crud_and_test_endpoints(self) -> None:
+        create_response = self.client.post(
+            "/api/proxy/groups",
+            headers=AUTH_HEADERS,
+            json={
+                "name": "HK Pool",
+                "nodes": [{"name": "node-a", "url": "http://127.0.0.1:7890"}],
+                "create_only": True,
+            },
+        )
+        self.assertEqual(create_response.status_code, 200, create_response.text)
+        payload = create_response.json()
+        self.assertEqual(payload["group"]["id"], "hk-pool")
+        self.assertEqual(payload["groups"][0]["nodes"][0]["id"], "node-a")
+
+        list_response = self.client.get("/api/proxy/groups", headers=AUTH_HEADERS)
+        self.assertEqual(list_response.status_code, 200, list_response.text)
+        self.assertEqual(list_response.json()["groups"][0]["id"], "hk-pool")
+
+        test_response = self.client.post(
+            "/api/proxy/groups/test",
+            headers=AUTH_HEADERS,
+            json={"id": "hk-pool"},
+        )
+        self.assertEqual(test_response.status_code, 200, test_response.text)
+        self.assertEqual(self.test_proxy_calls[-1], "http://127.0.0.1:7890")
+
+        delete_response = self.client.delete("/api/proxy/groups/hk-pool", headers=AUTH_HEADERS)
+        self.assertEqual(delete_response.status_code, 200, delete_response.text)
+        self.assertEqual(delete_response.json()["deleted"], "hk-pool")
+
 
 if __name__ == "__main__":
     unittest.main()

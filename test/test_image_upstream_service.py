@@ -137,13 +137,13 @@ class ImageUpstreamServiceTests(unittest.TestCase):
             downloader=lambda _url: (_ for _ in ()).throw(RuntimeError("download timeout")),
         )
 
-        with self.assertRaises(ImageGenerationError) as raised:
-            service.try_handle("generation", {"model": "gpt-image-2", "prompt": "test"})
+        result = service.try_handle("generation", {"model": "gpt-image-2", "prompt": "test"})
 
-        self.assertEqual(raised.exception.code, "image_archive_failed")
-        pending = getattr(raised.exception, "image_pending_archive")
+        self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/image.png")
+        pending = result["_image_pending_archive"]
         self.assertEqual(pending[0]["url"], "https://cdn.example.test/image.png")
         self.assertEqual(pending[0]["channel_name"], "first")
+        self.assertEqual(result["_image_upstream_selected"], "first")
 
     def test_url_archive_failure_falls_back_to_next_channel(self) -> None:
         service, storage, calls = self.make_service([

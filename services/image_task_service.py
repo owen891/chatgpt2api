@@ -350,8 +350,17 @@ class ImageTaskService:
                     setattr(error, "account_email", account_email)
                 raise error
             usage = result.get("usage")
+            pending_archive = _normalize_pending_archive(result.get("_image_pending_archive"))
             duration_ms = int((time.time() - started) * 1000)
-            if not self._update_task(key, status=TASK_STATUS_SUCCESS, data=data, usage=usage, error="", duration_ms=duration_ms):
+            if not self._update_task(
+                key,
+                status=TASK_STATUS_SUCCESS,
+                data=data,
+                usage=usage,
+                error="",
+                pending_archive=pending_archive,
+                duration_ms=duration_ms,
+            ):
                 return
             self._log_call(
                 identity,

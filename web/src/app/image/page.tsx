@@ -224,13 +224,19 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       b64_json: first.b64_json,
       url: first.url,
       revised_prompt: first.revised_prompt,
-      pendingArchive: undefined,
+      pendingArchive: task.pending_archive,
       error: undefined,
       durationMs: task.duration_ms,
     };
   }
 
   if (task.status === "error") {
+    const hasPendingArchive = task.pending_archive?.available;
+    const archiveErrorMessage = hasPendingArchive
+      ? task.error
+        ? `上游已生成图片，但归档失败：${task.error}`
+        : "上游已生成图片，但归档失败，可点击“重新归档”恢复"
+      : undefined;
     return {
       ...image,
       taskId: task.id,
@@ -238,7 +244,7 @@ function taskDataToStoredImage(image: StoredImage, task: ImageTask): StoredImage
       taskStatus: undefined,
       progress: undefined,
       pendingArchive: task.pending_archive,
-      error: task.error || "生成失败",
+      error: archiveErrorMessage || task.error || "生成失败",
       durationMs: task.duration_ms,
     };
   }
@@ -300,6 +306,7 @@ function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> 
   const failedCount = turn.images.filter((image) => image.status === "error").length;
   const successCount = turn.images.filter((image) => image.status === "success").length;
   const cancelledCount = turn.images.filter((image) => image.status === "cancelled").length;
+  const archiveFailedCount = turn.images.filter((image) => image.status === "error" && image.pendingArchive?.available).length;
   if (loadingCount > 0) {
     // 如果任何图片的 taskStatus 为 running，则状态为 generating
     const hasRunning = turn.images.some((image) => image.taskStatus === "running");
@@ -309,6 +316,9 @@ function deriveTurnStatus(turn: ImageTurn): Pick<ImageTurn, "status" | "error"> 
     return { status: turn.status === "queued" ? "queued" : "generating", error: undefined };
   }
   if (failedCount > 0) {
+    if (archiveFailedCount > 0) {
+      return { status: "error", error: `其中 ${archiveFailedCount} 张已生成成功，但归档失败` };
+    }
     return { status: "error", error: `其中 ${failedCount} 张未成功生成` };
   }
   if (cancelledCount > 0) {

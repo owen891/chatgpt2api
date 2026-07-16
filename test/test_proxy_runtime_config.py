@@ -8,6 +8,7 @@ from pathlib import Path
 from services.config import (
     DEFAULT_PROXY_RUNTIME,
     ConfigStore,
+    DEFAULT_PROXY_GROUP_NODE_IMAGE_CONCURRENCY_LIMIT,
     _normalize_proxy_runtime_settings,
 )
 
@@ -186,6 +187,30 @@ class ProxyRuntimeConfigTests(unittest.TestCase):
             self.assertEqual(raw_saved["proxy_runtime"], expected)
             reloaded = ConfigStore(store.path)
             self.assertEqual(reloaded.get_proxy_runtime_settings(), expected)
+
+    def test_proxy_groups_are_normalized_and_exposed_publicly(self) -> None:
+        tmp_dir, store = self._make_store({
+            "proxy_groups": [
+                {
+                    "name": "HK Pool",
+                    "nodes": [
+                        {"name": "node a", "url": " http://127.0.0.1:7890 "},
+                        {"name": "node a", "url": "http://ignored:7891"},
+                    ],
+                }
+            ]
+        })
+        with tmp_dir:
+            groups = store.get_proxy_groups_settings()
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["id"], "hk-pool")
+            self.assertEqual(groups[0]["nodes"][0]["id"], "node-a")
+            self.assertEqual(groups[0]["nodes"][0]["url"], "http://127.0.0.1:7890")
+            self.assertEqual(
+                groups[0]["nodes"][0]["image_concurrency_limit"],
+                DEFAULT_PROXY_GROUP_NODE_IMAGE_CONCURRENCY_LIMIT,
+            )
+            self.assertEqual(store.get()["proxy_groups"], groups)
 
     def test_public_proxy_runtime_redacts_and_preserves_existing_clearance_values(self) -> None:
         existing = copy.deepcopy(DEFAULT_PROXY_RUNTIME)

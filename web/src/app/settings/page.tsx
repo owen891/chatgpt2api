@@ -13,6 +13,7 @@ import { CPAPoolDialog } from "./components/cpa-pool-dialog";
 import { CPAPoolsCard } from "./components/cpa-pools-card";
 import { ImportBrowserDialog } from "./components/import-browser-dialog";
 import { ImageUpstreamsCard } from "./components/image-upstreams-card";
+import { ProxyGroupsCard } from "./components/proxy-groups-card";
 import { ProxyRuntimeCard } from "./components/proxy-runtime-card";
 import { SettingsHeader } from "./components/settings-header";
 import { Sub2APIConnections } from "./components/sub2api-connections";
@@ -26,7 +27,7 @@ const settingsTabs = [
   { value: "keys", title: "用户密钥" },
   { value: "api-docs", title: "接口接入" },
   { value: "canvas", title: "画布入口" },
-  { value: "proxy", title: "FlareSolverr" },
+  { value: "proxy", title: "代理" },
   { value: "image-upstreams", title: "生图上游" },
   { value: "cpa", title: "CPA" },
   { value: "sub2api", title: "Sub2API" },
@@ -95,7 +96,10 @@ function SettingsPageContent() {
           <ConfigCard />
         </TabsContent>
         <TabsContent value="proxy">
-          <ProxyRuntimeCard />
+          <div className="space-y-4">
+            <ProxyGroupsCard />
+            <ProxyRuntimeCard />
+          </div>
         </TabsContent>
         <TabsContent value="image-upstreams">
           <ImageUpstreamsCard />

@@ -109,6 +109,31 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(result["items"][0]["status"], "success")
             self.assertEqual(result["items"][0]["data"][0]["url"], "http://example.test/image.png")
 
+    def test_success_task_can_expose_upstream_url_when_archive_is_pending(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "image_tasks.json"
+
+            def handler(_payload):
+                return {
+                    "data": [{"url": "https://cdn.example.test/generated.png"}],
+                    "_image_pending_archive": [{"url": "https://cdn.example.test/generated.png", "channel_name": "backup"}],
+                }
+
+            service = self.make_service(path, handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="upstream-url-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            result = wait_for_task(service, OWNER, "upstream-url-task", "success")
+
+            self.assertEqual(result["data"][0]["url"], "https://cdn.example.test/generated.png")
+            self.assertTrue(result["pending_archive"]["available"])
+            self.assertEqual(result["pending_archive"]["channel_name"], "backup")
+
     def test_startup_marks_unfinished_tasks_as_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "image_tasks.json"

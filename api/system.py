@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request
@@ -40,27 +41,150 @@ class ClearanceTestRequest(BaseModel):
     target_url: str = "https://chatgpt.com"
 
 
+class ProxyGroupRequest(BaseModel):
+    id: str = ""
+    name: str = ""
+    strategy: str = "request_random"
+    rotation_interval_minutes: float = 0
+    enabled: bool = True
+    notes: str = ""
+    nodes: list[dict[str, Any]] = []
+    create_only: bool = False
+
+
+class ProxyGroupTestRequest(BaseModel):
+    id: str = ""
+    node_id: str = ""
+    url: str = ""
+
+
 class ImageDeleteRequest(BaseModel):
     paths: list[str] = []
     start_date: str = ""
     end_date: str = ""
     all_matching: bool = False
 
+
 class ImageDownloadRequest(BaseModel):
     paths: list[str]
+
 
 class ImageTagsRequest(BaseModel):
     path: str
     tags: list[str]
 
+
 class LogDeleteRequest(BaseModel):
     ids: list[str] = []
+
+
 class BackupDeleteRequest(BaseModel):
     key: str = ""
 
 
 class ImageUpstreamRequest(BaseModel):
     channel: dict[str, object]
+
+
+def _clean_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _slug_id(value: object) -> str:
+    raw = _clean_text(value).lower()
+    chars: list[str] = []
+    for char in raw:
+        if char.isalnum() or char in {"-", "_"}:
+            chars.append(char)
+        elif char.isspace():
+            chars.append("-")
+    return "".join(chars).strip("-_")
+
+
+def _proxy_group_id(value: object) -> str:
+    raw = _clean_text(value)
+    if raw.lower().startswith("group:"):
+        raw = raw.split(":", 1)[1]
+    return _slug_id(raw)
+
+
+def _coerce_proxy_group_rotation_minutes(value: object) -> float:
+    try:
+        minutes = float(value)
+    except (OverflowError, TypeError, ValueError):
+        minutes = 0.0
+    return max(0.0, min(minutes, 1440.0))
+
+
+def _coerce_proxy_node_image_concurrency_limit(value: object, *, default: int = 30) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        limit = int(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return default
+    return max(0, min(limit, 10000))
+
+
+def _config_dict_list(key: str) -> list[dict[str, Any]]:
+    getter = getattr(config, "get_proxy_groups_settings", None)
+    if key == "proxy_groups" and callable(getter):
+        raw = getter()
+    else:
+        raw = config.get().get(key)
+    if not isinstance(raw, list):
+        return []
+    return [dict(item) for item in raw if isinstance(item, dict)]
+
+
+def _proxy_groups_payload() -> dict[str, Any]:
+    return {"groups": _config_dict_list("proxy_groups")}
+
+
+def _upsert_proxy_group(body: ProxyGroupRequest) -> dict[str, Any]:
+    group_id = _proxy_group_id(body.id or body.name)
+    if not group_id:
+        raise ValueError("proxy group id is required")
+    groups = _config_dict_list("proxy_groups")
+    exists = any(_proxy_group_id(group.get("id")) == group_id for group in groups)
+    if body.create_only and exists:
+        raise ValueError("proxy group already exists")
+
+    nodes: list[dict[str, Any]] = []
+    seen_node_ids: set[str] = set()
+    for index, raw_node in enumerate(body.nodes):
+        if not isinstance(raw_node, dict):
+            continue
+        node_id = _slug_id(raw_node.get("id") or raw_node.get("name") or f"node-{index + 1}") or f"node-{index + 1}"
+        if node_id in seen_node_ids:
+            continue
+        seen_node_ids.add(node_id)
+        nodes.append({
+            "id": node_id,
+            "name": _clean_text(raw_node.get("name")) or node_id,
+            "url": _clean_text(raw_node.get("url")),
+            "enabled": bool(raw_node.get("enabled", True)),
+            "image_concurrency_limit": _coerce_proxy_node_image_concurrency_limit(
+                raw_node.get("image_concurrency_limit")
+                if raw_node.get("image_concurrency_limit") is not None
+                else raw_node.get("image_concurrency"),
+            ),
+        })
+
+    item = {
+        "id": group_id,
+        "name": body.name or group_id,
+        "strategy": body.strategy or "request_random",
+        "rotation_interval_minutes": _coerce_proxy_group_rotation_minutes(body.rotation_interval_minutes),
+        "enabled": body.enabled,
+        "notes": body.notes,
+        "nodes": nodes,
+    }
+    next_groups = [group for group in groups if _proxy_group_id(group.get("id")) != group_id]
+    next_groups.append(item)
+    updated = config.update({"proxy_groups": next_groups})
+    groups = [dict(group) for group in updated.get("proxy_groups", []) if isinstance(group, dict)]
+    return {"group": item, "groups": groups}
 
 
 def create_router(app_version: str) -> APIRouter:
@@ -185,16 +309,57 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/api/proxy/groups")
     async def get_proxy_groups_endpoint(authorization: str | None = Header(default=None)):
         require_admin(authorization)
-        runtime = config.get_proxy_runtime_settings()
-        proxy_url = str(runtime.get("proxy_url") or "").strip() or config.get_proxy_settings()
+        return _proxy_groups_payload()
+
+    @router.post("/api/proxy/groups")
+    async def save_proxy_group(body: ProxyGroupRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return _upsert_proxy_group(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+
+    @router.delete("/api/proxy/groups/{group_id}")
+    async def delete_proxy_group(group_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        normalized = _proxy_group_id(group_id)
+        groups = _config_dict_list("proxy_groups")
+        next_groups = [group for group in groups if _proxy_group_id(group.get("id")) != normalized]
+        if len(next_groups) == len(groups):
+            raise HTTPException(status_code=404, detail={"error": "proxy group not found"})
+        updated = config.update({"proxy_groups": next_groups})
+        return {"deleted": normalized, "groups": updated.get("proxy_groups", [])}
+
+    @router.post("/api/proxy/groups/test")
+    async def test_proxy_group_endpoint(body: ProxyGroupTestRequest, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        if _clean_text(body.url):
+            return {"result": await run_in_threadpool(test_proxy, _clean_text(body.url))}
+
+        group_id = _proxy_group_id(body.id)
+        if not group_id:
+            raise HTTPException(status_code=400, detail={"error": "proxy group id or url is required"})
+        group = next((item for item in _config_dict_list("proxy_groups") if _proxy_group_id(item.get("id")) == group_id), None)
+        if group is None:
+            raise HTTPException(status_code=404, detail={"error": "proxy group not found"})
+
+        node_id = _slug_id(body.node_id)
+        nodes = [dict(node) for node in group.get("nodes", []) if isinstance(node, dict)]
+        if node_id:
+            node = next((item for item in nodes if _slug_id(item.get("id") or item.get("name")) == node_id), None)
+        else:
+            node = next((item for item in nodes if item.get("enabled", True) is not False and _clean_text(item.get("url"))), None)
+        if node is None:
+            raise HTTPException(status_code=404, detail={"error": "proxy group node not found"})
+
+        proxy_url = _clean_text(node.get("url"))
         if not proxy_url:
-            return {"groups": []}
-        return {"groups": [{
-            "id": "runtime",
-            "name": "当前运行时代理",
-            "enabled": True,
-            "nodes": [{"id": "runtime", "name": proxy_url, "enabled": True}],
-        }]}
+            raise HTTPException(status_code=400, detail={"error": "proxy group node url is required"})
+        return {
+            "result": await run_in_threadpool(test_proxy, proxy_url),
+            "group": group,
+            "node": node,
+        }
 
     @router.post("/api/proxy/clearance/test")
     async def test_proxy_clearance_endpoint(body: ClearanceTestRequest, authorization: str | None = Header(default=None)):
@@ -287,7 +452,6 @@ def create_router(app_version: str) -> APIRouter:
             headers=headers,
         )
 
-
     @router.get("/api/images/tags")
     async def list_image_tags(authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -330,6 +494,7 @@ def create_router(app_version: str) -> APIRouter:
     @router.get("/health", response_model=None)
     async def health_dashboard(format: str = Query(default="html")):
         from services.account_service import account_service as acct_svc
+
         stats = acct_svc.get_stats()
         storage = config.get_storage_backend()
         storage_health = storage.health_check()
@@ -348,7 +513,7 @@ def create_router(app_version: str) -> APIRouter:
         return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="zh">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>号池健康监控 - chatgpt2api</title>
+<title>鍙锋睜鍋ュ悍鐩戞帶 - chatgpt2api</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:system-ui,-apple-system,sans-serif;background:#0f1117;color:#e2e8f0;min-height:100vh}}
@@ -373,24 +538,24 @@ td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{b
 </head>
 <body>
 <div class="header">
-<h1><span class="status-dot {'status-ok' if healthy else 'status-degraded'}"></span>号池健康监控</h1>
-<div style="font-size:13px;color:#94a3b8">v{app_version} · 30s 自动刷新</div>
+<h1><span class="status-dot {'status-ok' if healthy else 'status-degraded'}"></span>鍙锋睜鍋ュ悍鐩戞帶</h1>
+<div style="font-size:13px;color:#94a3b8">v{app_version} 路 30s 鑷姩鍒锋柊</div>
 </div>
 <div class="container">
 <div class="cards">
-<div class="card"><div class="label">号池状态</div><div class="value {'green' if healthy else 'yellow'}">{'正常' if healthy else '异常'}</div></div>
-<div class="card"><div class="label">当前账号</div><div class="value blue">{stats['total']}</div></div>
-<div class="card"><div class="label">累计入库</div><div class="value">{stats['cumulative_total']}</div></div>
-<div class="card"><div class="label">可用账号</div><div class="value green">{stats['active']}</div></div>
-<div class="card"><div class="label">剩余额度</div><div class="value">{stats['total_quota']}</div></div>
-<div class="card"><div class="label">限流</div><div class="value yellow">{stats['limited']}</div></div>
-<div class="card"><div class="label">异常</div><div class="value red">{stats['abnormal']}</div></div>
-<div class="card"><div class="label">禁用</div><div class="value">{stats['disabled']}</div></div>
-<div class="card"><div class="label">成功/失败</div><div class="value">{stats['total_success']}<span style="font-size:18px;color:#94a3b8">/</span><span class="red">{stats['total_fail']}</span></div></div>
+<div class="card"><div class="label">鍙锋睜鐘舵€?</div><div class="value {'green' if healthy else 'yellow'}">{'姝ｅ父' if healthy else '寮傚父'}</div></div>
+<div class="card"><div class="label">褰撳墠璐﹀彿</div><div class="value blue">{stats['total']}</div></div>
+<div class="card"><div class="label">绱鍏ュ簱</div><div class="value">{stats['cumulative_total']}</div></div>
+<div class="card"><div class="label">鍙敤璐﹀彿</div><div class="value green">{stats['active']}</div></div>
+<div class="card"><div class="label">鍓╀綑棰濆害</div><div class="value">{stats['total_quota']}</div></div>
+<div class="card"><div class="label">闄愭祦</div><div class="value yellow">{stats['limited']}</div></div>
+<div class="card"><div class="label">寮傚父</div><div class="value red">{stats['abnormal']}</div></div>
+<div class="card"><div class="label">绂佺敤</div><div class="value">{stats['disabled']}</div></div>
+<div class="card"><div class="label">鎴愬姛/澶辫触</div><div class="value">{stats['total_success']}<span style="font-size:18px;color:#94a3b8">/</span><span class="red">{stats['total_fail']}</span></div></div>
 </div>
-<h2 style="margin-bottom:12px;font-size:16px">账号类型分布</h2>
+<h2 style="margin-bottom:12px;font-size:16px">璐﹀彿绫诲瀷鍒嗗竷</h2>
 <table>
-<tr><th>类型</th><th>数量</th></tr>
+<tr><th>绫诲瀷</th><th>鏁伴噺</th></tr>
 {''.join(f'<tr><td>{t}</td><td>{c}</td></tr>' for t,c in sorted(stats['by_type'].items()))}
 </table>
 <div class="refresh">JSON: <span class="api-url">/health?format=json</span></div>

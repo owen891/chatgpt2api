@@ -6,12 +6,36 @@ import { Button } from "@/components/ui/button";
 
 import {
   type RegisterLogEntry,
-  Metric,
   SectionTitle,
   formatRegisterLogTime,
   getRegisterLogToneMeta,
   normalizeRegisterLogTone,
 } from "../register-shared";
+
+function formatElapsed(value: unknown) {
+  const seconds = Math.max(0, Number(value) || 0);
+  if (seconds >= 3600) return `${(seconds / 3600).toFixed(1)}h`;
+  if (seconds >= 60) return `${Math.round(seconds / 60)}m`;
+  return `${Math.round(seconds)}s`;
+}
+
+function RuntimeMetric({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: string | number;
+  hint?: string;
+}) {
+  return (
+    <div className="rounded-xl border border-stone-200/80 bg-stone-50/70 px-4 py-3">
+      <div className="text-xs text-stone-500">{label}</div>
+      <div className="mt-1 text-3xl font-semibold tabular-nums text-stone-900 dark:text-white">{value}</div>
+      {hint ? <div className="mt-1 text-xs text-stone-400">{hint}</div> : null}
+    </div>
+  );
+}
 
 export function RegisterRuntimePanel({
   action,
@@ -19,12 +43,9 @@ export function RegisterRuntimePanel({
   running,
   saving,
   stats,
+  configuredThreads,
   confirmedAvailable,
   confirmedQuota,
-  cachedQuota,
-  showNextCheck,
-  nextCheckSeconds,
-  history,
   onStart,
   onStop,
   onReset,
@@ -36,91 +57,119 @@ export function RegisterRuntimePanel({
   running: boolean;
   saving: boolean;
   stats: Record<string, unknown>;
+  configuredThreads: number;
   confirmedAvailable: number;
   confirmedQuota: number;
-  cachedQuota: number;
-  showNextCheck: boolean;
-  nextCheckSeconds: number;
-  history: Array<{ id: string; status: string; success?: number; fail?: number; finished_at: string }> | undefined;
   onStart: () => void;
   onStop: () => void;
   onReset: () => void;
   onSave: () => void;
   onCheckNow: () => void;
 }) {
-  return <div className="min-w-0 rounded-xl border border-stone-200/80 bg-white p-5 shadow-none">
-    <div className="space-y-5">
-      <SectionTitle title="执行控制" />
-      <div className="grid grid-cols-2 gap-3">
-        <Metric label="成功" value={Number(stats.success || 0)} />
-        <Metric label="失败" value={Number(stats.fail || 0)} />
-        <Metric label="完成" value={Number(stats.done || 0)} />
-        <Metric label="运行中" value={Number(stats.running || 0)} />
-      </div>
-      <div className="flex flex-wrap gap-2">
-        <Button disabled={Boolean(action) || saving || running} onClick={onStart}>
-          {action === "start" ? <LoaderCircle className="animate-spin" /> : <Play />}
-          启动
-        </Button>
-        <Button variant="outline" disabled={Boolean(action) || saving || !running} onClick={onStop}>
-          {action === "stop" ? <LoaderCircle className="animate-spin" /> : <Square />}
-          停止
-        </Button>
-        <Button variant="outline" disabled={Boolean(action) || saving || running} onClick={onReset}>
+  const success = Number(stats.success || 0);
+  const fail = Number(stats.fail || 0);
+  const done = Number(stats.done || 0);
+  const inflight = Number(stats.running || 0);
+  const avgSeconds = Number(stats.avg_seconds || 0);
+  const successRate = Number(stats.success_rate || 0);
+  const elapsed = formatElapsed(stats.elapsed_seconds);
+  const stopReason = String(stats.stop_reason || "").trim();
+  const lastCheckAt = String(stats.last_check_at || "").trim();
+
+  return (
+    <section className="min-w-0 rounded-xl border border-stone-200/80 bg-white shadow-none">
+      <div className="space-y-4 p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <SectionTitle title="执行控制" />
+          <span
+            className={`rounded-full px-3 py-1 text-xs font-medium ${
+              running ? "bg-emerald-100 text-emerald-700" : "bg-stone-100 text-stone-500"
+            }`}
+          >
+            {running ? "运行中" : "未启动"}
+          </span>
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <RuntimeMetric label="成功" value={success} hint={`成功率 ${successRate.toFixed(1)}%`} />
+          <RuntimeMetric label="失败" value={fail} />
+          <RuntimeMetric label="完成" value={done} />
+          <RuntimeMetric label="运行 / 线程" value={`${inflight} / ${configuredThreads}`} />
+          <RuntimeMetric label="运行时间" value={elapsed} />
+          <RuntimeMetric label="平均耗时" value={`${avgSeconds.toFixed(1)}s`} />
+          <RuntimeMetric label="当前额度" value={confirmedQuota} />
+          <RuntimeMetric label="正常账号" value={confirmedAvailable} />
+        </div>
+
+        <div className="grid gap-3 sm:grid-cols-2">
+          <Button
+            size="lg"
+            className="h-12"
+            disabled={Boolean(action) || saving || running}
+            onClick={onStart}
+          >
+            {action === "start" ? <LoaderCircle className="animate-spin" /> : <Play />}
+            启动
+          </Button>
+          <Button
+            size="lg"
+            variant="outline"
+            className="h-12"
+            disabled={Boolean(action) || saving || !running}
+            onClick={onStop}
+          >
+            {action === "stop" ? <LoaderCircle className="animate-spin" /> : <Square />}
+            停止
+          </Button>
+          <Button
+            variant="outline"
+            className="h-11"
+            disabled={saving}
+            onClick={onSave}
+          >
+            {saving ? <LoaderCircle className="animate-spin" /> : <Save />}
+            保存配置
+          </Button>
+          <Button
+            variant="outline"
+            className="h-11"
+            disabled={checking}
+            onClick={onCheckNow}
+          >
+            {checking ? <LoaderCircle className="animate-spin" /> : <RefreshCw />}
+            刷新状态
+          </Button>
+        </div>
+
+        <Button
+          variant="outline"
+          className="h-11 w-full"
+          disabled={Boolean(action) || saving || running}
+          onClick={onReset}
+        >
           {action === "reset" ? <LoaderCircle className="animate-spin" /> : <RotateCcw />}
           重置
         </Button>
-        <Button variant="outline" disabled={saving} onClick={onSave}>
-          {saving ? <LoaderCircle className="animate-spin" /> : <Save />}
-          保存
-        </Button>
-        <Button variant="outline" disabled={checking} onClick={onCheckNow}>
-          {checking ? <LoaderCircle className="animate-spin" /> : <RefreshCw />}
-          立即检查
-        </Button>
-      </div>
-      <div className="text-xs leading-5 text-stone-500">
-        确认账号: {confirmedAvailable}，确认额度: {confirmedQuota}，缓存额度: {cachedQuota}，成功率: {Number(stats.success_rate || 0).toFixed(1)}%
-        {showNextCheck ? `，${nextCheckSeconds > 0 ? `下次检查 ${nextCheckSeconds} 秒后` : "等待检查"}` : ""}
-      </div>
-      {stats.stop_reason ? <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">状态说明: {String(stats.stop_reason)}</div> : null}
-      {Object.keys((stats.channel_health as Record<string, { success?: number; fail?: number }> | undefined) || {}).length ? <div className="space-y-1 border-t border-stone-100 pt-3 text-xs text-stone-500 dark:border-white/10">
-        <div className="font-medium text-stone-700 dark:text-stone-200">邮箱渠道健康</div>
-        {Object.entries((stats.channel_health as Record<string, { success?: number; fail?: number }> | undefined) || {}).map(([name, health]) => <div key={name} className="flex justify-between gap-3">
-          <span className="truncate">{name}</span>
-          <span className="shrink-0 text-stone-400">成功 {health.success || 0} / 失败 {health.fail || 0}</span>
-        </div>)}
-      </div> : null}
-      {history?.length ? <div className="space-y-1 border-t border-stone-100 pt-3 text-xs text-stone-500 dark:border-white/10">
-        <div className="font-medium text-stone-700 dark:text-stone-200">最近补池</div>
-        {history.slice().reverse().slice(0, 3).map((item) => <div key={item.id} className="flex justify-between gap-3">
-          <span>{item.status === "completed" ? "完成" : item.status === "cooldown" ? "冷却" : "停止"} · {item.success || 0} 成功 / {item.fail || 0} 失败</span>
-          <span className="shrink-0">{formatRegisterLogTime(item.finished_at)}</span>
-        </div>)}
-      </div> : null}
-    </div>
-  </div>;
-}
 
-function LogSummaryMetric({
-  label,
-  value,
-  tone,
-}: {
-  label: string;
-  value: number;
-  tone: "error" | "warning" | "info";
-}) {
-  const styles = tone === "error"
-    ? "border-red-100 bg-red-50/55 text-red-700 dark:border-red-500/20 dark:bg-red-500/10 dark:text-red-200"
-    : tone === "warning"
-      ? "border-amber-100 bg-amber-50/55 text-amber-700 dark:border-amber-500/20 dark:bg-amber-500/10 dark:text-amber-200"
-      : "border-stone-200 bg-white/90 text-stone-700 dark:border-white/10 dark:bg-stone-900 dark:text-stone-100";
+        <div className="rounded-xl border border-stone-200/80 bg-stone-50/50 px-4 py-3 text-sm text-stone-600">
+          <div>当前确认可用账号：{confirmedAvailable}</div>
+          <div className="mt-1">当前确认剩余额度：{confirmedQuota}</div>
+          <div className="mt-1">最近平均耗时：{avgSeconds.toFixed(1)}s</div>
+          {lastCheckAt ? <div className="mt-1">最近检查：{lastCheckAt}</div> : null}
+        </div>
 
-  return <div className={`rounded-lg border px-3 py-2 ${styles}`}>
-    <div className="text-[11px]">{label}</div>
-    <div className="mt-1 text-2xl font-semibold tabular-nums">{value}</div>
-  </div>;
+        {stopReason ? (
+          <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            停止原因：{stopReason}
+          </div>
+        ) : (
+          <div className="rounded-xl border border-stone-200/80 bg-white px-4 py-3 text-sm text-stone-500">
+            启动前建议先保存配置；运行中可随时刷新状态查看补池进展。
+          </div>
+        )}
+      </div>
+    </section>
+  );
 }
 
 export function RegisterLogPanel({
@@ -131,73 +180,67 @@ export function RegisterLogPanel({
   logs: RegisterLogEntry[] | undefined;
 }) {
   const entries = logs?.length ? [...logs].reverse() : [];
-  const counts = entries.reduce((result, entry) => {
-    const tone = normalizeRegisterLogTone(entry.level);
-    result[tone] += 1;
-    return result;
-  }, { info: 0, warning: 0, error: 0 });
+  const counts = entries.reduce(
+    (result, entry) => {
+      const tone = normalizeRegisterLogTone(entry.level);
+      result[tone] += 1;
+      return result;
+    },
+    { info: 0, warning: 0, error: 0 },
+  );
 
-  return <div className="min-w-0 rounded-xl border border-stone-200/80 bg-white/95 shadow-none xl:sticky xl:top-4">
-    <div className="min-w-0 space-y-4 p-5">
-      <div className="flex items-start justify-between gap-3">
-        <SectionTitle title="实时日志" />
-        <span className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-[11px] text-stone-500 dark:border-white/10 dark:bg-stone-900 dark:text-stone-300">
-          {entries.length} 条
-        </span>
-      </div>
+  return (
+    <section className="min-w-0 rounded-xl border border-stone-200/80 bg-white shadow-none xl:sticky xl:top-4">
+      <div className="space-y-4 p-4">
+        <div className="flex items-start justify-between gap-3">
+          <SectionTitle title="实时日志" />
+          <div className="text-right text-xs text-stone-500">
+            <div>{entries.length} 条</div>
+            <div>错 {counts.error} / 警 {counts.warning} / 信 {counts.info}</div>
+          </div>
+        </div>
 
-      <div className="grid grid-cols-3 gap-2">
-        <LogSummaryMetric label="错误" value={counts.error} tone="error" />
-        <LogSummaryMetric label="警告" value={counts.warning} tone="warning" />
-        <LogSummaryMetric label="信息" value={counts.info} tone="info" />
-      </div>
-
-      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-stone-200/70 bg-stone-50/70 px-3 py-2 text-[11px] text-stone-500 dark:border-white/10 dark:bg-stone-900/70 dark:text-stone-300">
-        <span>最新日志显示在上方</span>
-        <span>紧凑排版，优先看内容本身</span>
-      </div>
-
-      <div className="rounded-lg border border-stone-200/80 bg-[linear-gradient(180deg,rgba(250,248,244,0.9),rgba(246,243,238,0.72))] p-2 dark:border-white/10 dark:bg-stone-950">
         <div
           ref={logRef}
-          className="h-[540px] min-w-0 space-y-1.5 overflow-y-auto overflow-x-hidden pr-1"
+          className="h-[620px] min-w-0 space-y-2 overflow-y-auto overflow-x-hidden rounded-md border border-stone-200 p-2"
         >
-          {entries.length ? entries.map((log, index) => {
-            const meta = getRegisterLogToneMeta(log.level);
-            const accent = meta.tone === "error"
-              ? "border-l-red-400"
-              : meta.tone === "warning"
-                ? "border-l-amber-400"
-                : "border-l-stone-300 dark:border-l-stone-700";
-            const dot = meta.tone === "error"
-              ? "bg-red-500"
-              : meta.tone === "warning"
-                ? "bg-amber-500"
-                : "bg-stone-400";
+          {entries.length ? (
+            entries.map((log, index) => {
+              const meta = getRegisterLogToneMeta(log.level);
+              const borderClassName =
+                meta.tone === "error"
+                  ? "border-red-200"
+                  : meta.tone === "warning"
+                    ? "border-amber-200"
+                    : "border-stone-200";
 
-            return <article
-              key={`${log.time}-${index}`}
-              data-log-time={log.time}
-              className={`min-w-0 rounded-md border border-stone-200/80 border-l-[3px] bg-white/92 px-3 py-2 shadow-[0_1px_0_rgba(28,25,23,0.04)] transition-colors hover:bg-white dark:border-white/10 dark:bg-stone-900/85 dark:hover:bg-stone-900 ${accent}`}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2">
-                  <span className={`h-2 w-2 shrink-0 rounded-full ${dot}`} />
-                  <span className={`inline-flex shrink-0 items-center rounded-full border px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-[0.14em] ${meta.badgeClassName}`}>
-                    {meta.label}
-                  </span>
-                </div>
-                <span className="shrink-0 text-[10px] tabular-nums text-stone-400">
-                  {formatRegisterLogTime(log.time)}
-                </span>
-              </div>
-              <div className="mt-1.5 break-all font-mono text-[11px] leading-5 text-stone-700 dark:text-stone-100">
-                {log.text}
-              </div>
-            </article>;
-          }) : <div className="rounded-lg border border-dashed border-stone-200 bg-white/70 px-4 py-8 text-center text-sm text-stone-500 dark:border-white/10 dark:bg-stone-900/70">暂无日志</div>}
+              return (
+                <article
+                  key={`${log.time}-${index}`}
+                  data-log-time={log.time}
+                  className={`min-w-0 rounded-md border px-3 py-2 ${borderClassName}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] ${meta.badgeClassName}`}>
+                      {meta.label}
+                    </span>
+                    <span className="shrink-0 text-[10px] tabular-nums text-stone-400">
+                      {formatRegisterLogTime(log.time)}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 break-all font-mono text-[11px] leading-5 text-stone-700 dark:text-stone-100">
+                    {log.text}
+                  </div>
+                </article>
+              );
+            })
+          ) : (
+            <div className="rounded-md border border-dashed border-stone-200 px-4 py-8 text-center text-sm text-stone-500">
+              暂无日志
+            </div>
+          )}
         </div>
       </div>
-    </div>
-  </div>;
+    </section>
+  );
 }

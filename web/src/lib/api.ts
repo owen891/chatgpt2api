@@ -151,6 +151,24 @@ export type ProxyRuntimeResponse = {
   status: ProxyRuntimeStatus;
 };
 
+export type ProxyGroupNode = {
+  id: string;
+  name: string;
+  url: string;
+  enabled?: boolean;
+  image_concurrency_limit?: number | string;
+};
+
+export type ProxyGroup = {
+  id: string;
+  name: string;
+  strategy?: string;
+  rotation_interval_minutes?: number | string;
+  enabled?: boolean;
+  notes?: string;
+  nodes?: ProxyGroupNode[];
+};
+
 export type ThirdPartyAppsSettings = {
   infinite_canvas: {
     enabled: boolean;
@@ -823,14 +841,7 @@ export async function resetRegister() {
 }
 
 export async function checkRegisterPool() {
-  return httpRequest<{ register: RegisterConfig }>("/api/register/check", { method: "POST", body: {} });
-}
-
-export async function createRegisterEventTicket() {
-  return httpRequest<{ ticket: string; expires_in: number }>("/api/register/events/ticket", {
-    method: "POST",
-    body: {},
-  });
+  return fetchRegisterConfig();
 }
 
 export type RegisterGptMailStatus = {
@@ -848,15 +859,34 @@ export type RegisterGptMailStatus = {
   [key: string]: unknown;
 };
 
-export type RegisterProxyGroup = {
-  id: string;
-  name: string;
-  enabled?: boolean;
-  nodes?: Array<{ id: string; name: string; enabled?: boolean }>;
-};
+export type RegisterProxyGroup = ProxyGroup;
 
 export async function fetchRegisterProxyGroups() {
   return httpRequest<{ groups: RegisterProxyGroup[] }>("/api/proxy/groups");
+}
+
+export async function fetchProxyGroups() {
+  return httpRequest<{ groups: ProxyGroup[] }>("/api/proxy/groups");
+}
+
+export async function saveProxyGroup(group: ProxyGroup & { create_only?: boolean }) {
+  return httpRequest<{ group: ProxyGroup; groups: ProxyGroup[] }>("/api/proxy/groups", {
+    method: "POST",
+    body: group,
+  });
+}
+
+export async function deleteProxyGroup(groupId: string) {
+  return httpRequest<{ deleted: string; groups: ProxyGroup[] }>(`/api/proxy/groups/${encodeURIComponent(groupId)}`, {
+    method: "DELETE",
+  });
+}
+
+export async function testProxyGroup(input: { id?: string; node_id?: string; url?: string }) {
+  return httpRequest<{ result: ProxyTestResult; group?: ProxyGroup; node?: ProxyGroupNode }>("/api/proxy/groups/test", {
+    method: "POST",
+    body: input,
+  });
 }
 
 export async function fetchGptMailStatus(provider: RegisterProvider, force = true) {

@@ -4,10 +4,8 @@ import { toast } from "sonner";
 import webConfig from "@/constants/common-env";
 import {
   checkRegisterPool,
-  createRegisterEventTicket,
   fetchGptMailStatus,
   fetchRegisterConfig,
-  fetchRegisterProxyGroups,
   resetOutlookPool,
   resetRegister,
   startRegister,
@@ -16,8 +14,8 @@ import {
   type RegisterConfig,
   type RegisterGptMailStatus,
   type RegisterProvider,
-  type RegisterProxyGroup,
 } from "@/lib/api";
+import { getStoredAuthKey } from "@/store/auth";
 
 import { defaultProvider, mergeRuntimeSnapshot, normalizeConfig, providerId, providerMissing } from "./register-shared";
 
@@ -27,12 +25,9 @@ export function useRegisterPageRuntime() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [action, setAction] = useState<string | null>(null);
-  const [proxyGroups, setProxyGroups] = useState<RegisterProxyGroup[]>([]);
-  const [proxyMode, setProxyMode] = useState("default");
   const [gptmailStatus, setGptmailStatus] = useState<Record<number, RegisterGptMailStatus>>({});
   const [gptmailBusy, setGptmailBusy] = useState<number | null>(null);
   const [checking, setChecking] = useState(false);
-  const [now, setNow] = useState(() => Date.now());
 
   const load = async (runtimeOnly = false) => {
     try {
@@ -44,7 +39,6 @@ export function useRegisterPageRuntime() {
       }
       setConfig(next);
       setProviders(next.mail.providers || []);
-      setProxyMode(next.proxy === "direct" ? "direct" : next.proxy?.startsWith("group:") ? next.proxy : next.proxy ? "custom" : "default");
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "加载注册机配置失败");
     } finally {
@@ -57,19 +51,10 @@ export function useRegisterPageRuntime() {
   }, []);
 
   useEffect(() => {
-    void fetchRegisterProxyGroups().then((data) => setProxyGroups(data.groups || [])).catch(() => setProxyGroups([]));
-  }, []);
-
-  useEffect(() => {
     if (!config?.enabled) return;
     const timer = window.setInterval(() => void load(true), 2000);
     return () => window.clearInterval(timer);
   }, [config?.enabled]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
 
   useEffect(() => {
     if (!config?.enabled || typeof window === "undefined") return;
@@ -90,10 +75,14 @@ export function useRegisterPageRuntime() {
 
     const connect = async () => {
       try {
-        const { ticket } = await createRegisterEventTicket();
+        const authKey = await getStoredAuthKey();
+        if (!authKey) {
+          scheduleReconnect();
+          return;
+        }
         if (!active) return;
         const apiBaseUrl = webConfig.apiUrl.replace(/\/$/, "") || window.location.origin;
-        const nextSource = new EventSource(`${apiBaseUrl}/api/register/events?ticket=${encodeURIComponent(ticket)}`);
+        const nextSource = new EventSource(`${apiBaseUrl}/api/register/events?token=${encodeURIComponent(authKey)}`);
         source = nextSource;
         nextSource.onopen = () => {
           reconnectAttempt = 0;
@@ -104,7 +93,7 @@ export function useRegisterPageRuntime() {
             const next = normalizeConfig(raw.register || raw);
             setConfig((current) => current ? mergeRuntimeSnapshot(current, next) : next);
           } catch {
-            // Ignore malformed event payloads. The next SSE or polling pass will correct it.
+            // Ignore malformed payloads; next event or poll will self-heal.
           }
         };
         nextSource.onerror = () => {
@@ -127,47 +116,25 @@ export function useRegisterPageRuntime() {
 
   const running = Boolean(config?.enabled);
   const stats = config?.stats || {};
-  const phase = String(stats.phase || (running ? "starting" : "stopped"));
+  const inferredPhase = running
+    ? Number(stats.running || 0) > 0
+      ? "registering"
+      : config?.mode === "total"
+        ? "starting"
+        : "monitoring"
+    : "stopped";
+  const phase = String(stats.phase || inferredPhase);
   const confirmedQuota = Number(stats.current_quota || 0);
-  const cachedQuota = Number(stats.estimated_quota || 0);
   const confirmedAvailable = Number(stats.current_available || 0);
-  const pendingAvailable = Number(stats.unconfirmed_available || 0);
-  const nextCheckAt = stats.next_check_at ? new Date(String(stats.next_check_at)).getTime() : 0;
-  const nextCheckSeconds = nextCheckAt > now ? Math.ceil((nextCheckAt - now) / 1000) : 0;
-  const showNextCheck = Boolean(config?.enabled && nextCheckAt && (phase === "monitoring" || phase === "cooldown"));
   const modeLabel = useMemo(() => ({ total: "注册总数", quota: "目标剩余额度", available: "目标可用账号" }[config?.mode || "total"] || "注册总数"), [config?.mode]);
   const targetSummary = config?.mode === "quota"
     ? { label: "确认额度进度", value: `${confirmedQuota} / ${config.target_quota}` }
     : config?.mode === "available"
       ? { label: "确认账号进度", value: `${confirmedAvailable} / ${config.target_available}` }
       : { label: "注册进度", value: `${stats.done || 0} / ${config?.total || 0}` };
-  const diagnostics = typeof stats.diagnostics === "object" && stats.diagnostics ? stats.diagnostics : {};
-  const funnelEntries = Object.entries((diagnostics.funnel as Record<string, Record<string, number>> | undefined) || {});
-  const providerEntries = Object.entries((diagnostics.providers as Record<string, Record<string, unknown>> | undefined) || {});
-  const egressEntries = Object.entries((diagnostics.egresses as Record<string, Record<string, unknown>> | undefined) || {}).sort((a, b) => {
-    const left = Number(b[1]?.fail || 0) + Number(b[1]?.success || 0);
-    const right = Number(a[1]?.fail || 0) + Number(a[1]?.success || 0);
-    return left - right;
-  });
-  const failureKindEntries = Object.entries((diagnostics.failure_kinds as Record<string, number> | undefined) || {}).sort((a, b) => b[1] - a[1]);
-  const recentFailures = Array.isArray(diagnostics.recent_failures) ? diagnostics.recent_failures as Array<Record<string, unknown>> : [];
 
   const patch = (changes: Partial<RegisterConfig>) => {
     setConfig((current) => current ? normalizeConfig({ ...current, ...changes }) : current);
-  };
-
-  const changeProxyMode = (mode: string) => {
-    setProxyMode(mode);
-    if (mode === "direct") patch({ proxy: "direct" });
-    else if (mode.startsWith("group:")) {
-      const group = proxyGroups.find((item) => `group:${item.id}` === mode);
-      const node = group?.nodes?.find((item) => item.enabled !== false);
-      patch({ proxy: node?.name || "" });
-    } else if (mode === "default") {
-      patch({ proxy: "" });
-    } else if (config?.proxy === "direct" || config?.proxy?.startsWith("group:")) {
-      patch({ proxy: "" });
-    }
   };
 
   const persist = async (showToast = true) => {
@@ -241,9 +208,9 @@ export function useRegisterPageRuntime() {
       const next = normalizeConfig(data.register);
       setConfig(next);
       setProviders(next.mail.providers || []);
-      toast.success("已触发号池检查");
+      toast.success("注册机状态已刷新");
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : "号池检查失败");
+      toast.error(error instanceof Error ? error.message : "刷新注册机状态失败");
     } finally {
       setChecking(false);
     }
@@ -299,8 +266,6 @@ export function useRegisterPageRuntime() {
     loading,
     saving,
     action,
-    proxyGroups,
-    proxyMode,
     gptmailStatus,
     gptmailBusy,
     checking,
@@ -308,24 +273,12 @@ export function useRegisterPageRuntime() {
     stats,
     phase,
     confirmedQuota,
-    cachedQuota,
     confirmedAvailable,
-    pendingAvailable,
-    nextCheckSeconds,
-    showNextCheck,
     modeLabel,
     targetSummary,
-    diagnostics,
-    funnelEntries,
-    providerEntries,
-    egressEntries,
-    failureKindEntries,
-    recentFailures,
     patch,
-    changeProxyMode,
     save,
     start,
-    runAction,
     checkNow,
     stopTask,
     resetTask,

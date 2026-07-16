@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import json
+import random
 import re
 import threading
 import time
@@ -41,6 +42,9 @@ def normalize_proxy_url(url: str) -> str:
 class ProxyRuntimeProfile:
     proxy_url: str = ""
     proxy_source: str = "direct"
+    proxy_group_id: str = ""
+    proxy_node_id: str = ""
+    proxy_node_name: str = ""
     resource: bool = False
     runtime_enabled: bool = False
     egress_mode: str = "direct"
@@ -96,6 +100,16 @@ class ClearanceBundle:
 
     def cookie_header(self) -> str:
         return _cookies_to_header(self.cookies)
+
+
+@dataclass(frozen=True)
+class ResolvedProxyReference:
+    proxy_url: str = ""
+    proxy_source: str = "direct"
+    terminal: bool = False
+    proxy_group_id: str = ""
+    proxy_node_id: str = ""
+    proxy_node_name: str = ""
 
 
 class FlareSolverrClearanceProvider:
@@ -180,35 +194,43 @@ class ProxySettingsStore:
         runtime_enabled = bool(runtime.get("enabled"))
         egress_mode = str(runtime.get("egress_mode") or "direct").strip().lower()
 
-        account_proxy = _clean((account or {}).get("proxy") if isinstance(account, dict) else "")
-        explicit_proxy = _clean(proxy)
-        legacy_proxy = _clean(self._config.get_proxy_settings())
-
         runtime_proxy = ""
-        runtime_proxy_source = "runtime"
         if upstream and runtime_enabled and egress_mode == "single_proxy":
             resource_proxy = _clean(runtime.get("resource_proxy_url")) if resource else ""
             runtime_proxy = resource_proxy or _clean(runtime.get("proxy_url"))
-            runtime_proxy_source = "runtime_resource" if resource_proxy else "runtime"
+        runtime_reference = ResolvedProxyReference(
+            proxy_url=normalize_proxy_url(runtime_proxy),
+            proxy_source="runtime_resource" if resource and runtime_proxy else "runtime",
+            terminal=bool(runtime_proxy),
+        )
+        account_reference = self._resolve_proxy_reference(
+            (account or {}).get("proxy") if isinstance(account, dict) else "",
+            source="account",
+            terminal_when_unresolved=True,
+        )
+        explicit_reference = self._resolve_proxy_reference(
+            proxy,
+            source="explicit",
+            terminal_when_unresolved=True,
+        )
+        global_reference = self._resolve_proxy_reference(
+            self._config.get_proxy_settings(),
+            source="global",
+            terminal_when_unresolved=True,
+        )
 
-        selected_proxy = ""
-        source = "direct"
-        if account_proxy:
-            selected_proxy = account_proxy
-            source = "account"
-        elif runtime_proxy:
-            selected_proxy = runtime_proxy
-            source = runtime_proxy_source
-        elif explicit_proxy:
-            selected_proxy = explicit_proxy
-            source = "explicit"
-        elif legacy_proxy:
-            selected_proxy = legacy_proxy
-            source = "global"
+        selected_reference = ResolvedProxyReference()
+        for candidate in (account_reference, runtime_reference, explicit_reference, global_reference):
+            if candidate.proxy_url or candidate.terminal:
+                selected_reference = candidate
+                break
 
         return ProxyRuntimeProfile(
-            proxy_url=normalize_proxy_url(selected_proxy),
-            proxy_source=source,
+            proxy_url=selected_reference.proxy_url,
+            proxy_source=selected_reference.proxy_source,
+            proxy_group_id=selected_reference.proxy_group_id,
+            proxy_node_id=selected_reference.proxy_node_id,
+            proxy_node_name=selected_reference.proxy_node_name,
             resource=bool(resource),
             runtime_enabled=runtime_enabled,
             egress_mode=egress_mode,
@@ -359,6 +381,61 @@ class ProxySettingsStore:
             runtime = {}
         return runtime if isinstance(runtime, dict) else {}
 
+    def _get_proxy_groups_settings(self) -> list[dict[str, object]]:
+        try:
+            groups = self._config.get_proxy_groups_settings()
+        except AttributeError:
+            groups = []
+        return [dict(item) for item in groups if isinstance(item, dict)]
+
+    def _resolve_proxy_reference(
+        self,
+        value: object,
+        *,
+        source: str,
+        terminal_when_unresolved: bool,
+    ) -> ResolvedProxyReference:
+        raw = _clean(value)
+        lowered = raw.lower()
+        if not raw:
+            return ResolvedProxyReference(proxy_source=source)
+        if lowered == "direct":
+            return ResolvedProxyReference(proxy_source=f"{source}_direct", terminal=True)
+        if lowered.startswith("group:"):
+            group_id = _proxy_group_id(raw)
+            group, node = self._resolve_proxy_group(group_id)
+            proxy_url = normalize_proxy_url(_clean((node or {}).get("url")))
+            return ResolvedProxyReference(
+                proxy_url=proxy_url,
+                proxy_source=f"{source}_group",
+                terminal=bool(proxy_url) or terminal_when_unresolved,
+                proxy_group_id=_clean((group or {}).get("id")),
+                proxy_node_id=_proxy_node_id(node) if node else "",
+                proxy_node_name=_clean((node or {}).get("name")),
+            )
+        return ResolvedProxyReference(
+            proxy_url=normalize_proxy_url(raw),
+            proxy_source=source,
+            terminal=True,
+        )
+
+    def _resolve_proxy_group(self, group_id: str) -> tuple[dict[str, object] | None, dict[str, object] | None]:
+        normalized = _proxy_group_id(group_id)
+        if not normalized:
+            return None, None
+        for group in self._get_proxy_groups_settings():
+            if _proxy_group_id(group.get("id")) != normalized or group.get("enabled") is False:
+                continue
+            nodes = [
+                dict(node)
+                for node in (group.get("nodes") or [])
+                if isinstance(node, dict) and node.get("enabled", True) is not False and _clean(node.get("url"))
+            ]
+            if not nodes:
+                return group, None
+            return group, random.choice(nodes)
+        return None, None
+
     def _bundle_for_headers(self, profile: ProxyRuntimeProfile, target_host: str) -> ClearanceBundle | None:
         key = self._cache_key(profile.proxy_url, target_host)
         if profile.clearance_mode == "manual":
@@ -422,6 +499,30 @@ class ProxySettingsStore:
 
 def _clean(value: object) -> str:
     return str(value or "").strip()
+
+
+def _slug_id(value: object) -> str:
+    raw = _clean(value).lower()
+    chars: list[str] = []
+    for char in raw:
+        if char.isalnum() or char in {"-", "_"}:
+            chars.append(char)
+        elif char.isspace():
+            chars.append("-")
+    return "".join(chars).strip("-_")
+
+
+def _proxy_group_id(value: object) -> str:
+    raw = _clean(value)
+    if raw.lower().startswith("group:"):
+        raw = raw.split(":", 1)[1]
+    return _slug_id(raw)
+
+
+def _proxy_node_id(node: Mapping[str, object] | None) -> str:
+    if not node:
+        return ""
+    return _slug_id(node.get("id") or node.get("name")) or "node"
 
 
 def _colon_proxy_to_url(url: str) -> str:
@@ -542,9 +643,17 @@ def _redact_url_credentials(text: str) -> str:
 
 
 def test_proxy(url: str = "", *, timeout: float = 15.0) -> dict:
-    candidate = normalize_proxy_url(_clean(url))
+    requested = _clean(url)
+    candidate = ""
     proxy_source = "input"
-    if not candidate:
+    if requested:
+        if requested.lower() == "direct" or requested.lower().startswith("group:"):
+            profile = proxy_settings.get_profile(proxy=requested)
+            candidate = profile.proxy_url
+            proxy_source = profile.proxy_source or "input"
+        else:
+            candidate = normalize_proxy_url(requested)
+    if not candidate and not requested:
         profile = proxy_settings.get_profile(upstream=True)
         candidate = profile.proxy_url
         proxy_source = profile.proxy_source

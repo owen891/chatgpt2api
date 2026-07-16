@@ -1482,9 +1482,7 @@ class YydsMailProvider(BaseMailProvider):
 
     def __init__(self, entry: dict, conf: dict):
         super().__init__(conf, str(entry.get("provider_ref") or ""))
-        self.api_base = str(entry.get("api_base") or "").rstrip("/")
-        if not self.api_base:
-            raise RuntimeError("YYDSMail api_base is required")
+        self.api_base = str(entry.get("api_base") or "https://maliapi.215.im/v1").rstrip("/")
         self.api_key = str(entry["api_key"]).strip()
         self.domain = [str(item).strip() for item in (entry.get("domain") or []) if str(item).strip()]
         self.subdomain = str(entry.get("subdomain") or "").strip()

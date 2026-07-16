@@ -287,6 +287,28 @@ export function ImageResults({
                                 {imageMeta ? <span className="block text-stone-400">{imageMeta}</span> : null}
                               </div>
                               <div className="flex items-center gap-1.5">
+                                {image.pendingArchive?.available && image.taskId ? (
+                                  <>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      className="h-7 rounded-full border-sky-200 bg-sky-50 px-3 text-[10px] text-sky-700 hover:bg-sky-100 sm:h-8 sm:text-xs"
+                                      onClick={() => void onCopyArchiveSource(selectedConversation.id, turn.id, image.id)}
+                                    >
+                                      <Copy className="size-3 sm:size-4" />
+                                      <span className="hidden sm:inline">复制上游链接</span>
+                                    </Button>
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      className="h-7 rounded-full border-emerald-200 bg-emerald-50 px-3 text-[10px] text-emerald-700 hover:bg-emerald-100 sm:h-8 sm:text-xs"
+                                      onClick={() => void onRetryArchive(selectedConversation.id, turn.id, image.id)}
+                                    >
+                                      <RotateCcw className="size-3 sm:size-4" />
+                                      <span className="hidden sm:inline">重新归档</span>
+                                    </Button>
+                                  </>
+                                ) : null}
                                 <Button
                                   variant="outline"
                                   size="sm"

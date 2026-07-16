@@ -57,6 +57,8 @@ DEFAULT_PROXY_RUNTIME_USER_AGENT = (
     "Chrome/145.0.0.0 Safari/537.36"
 )
 
+DEFAULT_PROXY_GROUP_NODE_IMAGE_CONCURRENCY_LIMIT = 30
+
 DEFAULT_PROXY_RUNTIME = {
     "enabled": False,
     "egress_mode": "direct",
@@ -90,6 +92,21 @@ DEFAULT_IMAGE_UPSTREAMS = {
     "alert_webhook_url": "",
     "channels": [],
 }
+
+
+def _clean_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _slug_id(value: object) -> str:
+    raw = _clean_text(value).lower()
+    chars: list[str] = []
+    for char in raw:
+        if char.isalnum() or char in {"-", "_"}:
+            chars.append(char)
+        elif char.isspace():
+            chars.append("-")
+    return "".join(chars).strip("-_")
 
 
 def _normalize_bool(value: object, default: bool = False) -> bool:
@@ -283,6 +300,74 @@ def _normalize_proxy_runtime_settings(value: object) -> dict[str, object]:
             ),
         },
     }
+
+
+def _normalize_proxy_group_rotation_minutes(value: object) -> float:
+    try:
+        minutes = float(value)
+    except (OverflowError, TypeError, ValueError):
+        minutes = 0.0
+    return max(0.0, min(minutes, 1440.0))
+
+
+def _normalize_proxy_node_image_concurrency_limit(
+    value: object,
+    *,
+    default: int = DEFAULT_PROXY_GROUP_NODE_IMAGE_CONCURRENCY_LIMIT,
+) -> int:
+    if value is None or value == "":
+        return default
+    try:
+        limit = int(float(value))
+    except (OverflowError, TypeError, ValueError):
+        return default
+    return max(0, min(limit, 10000))
+
+
+def _normalize_proxy_groups(value: object) -> list[dict[str, object]]:
+    source = value if isinstance(value, list) else []
+    groups: list[dict[str, object]] = []
+    seen_group_ids: set[str] = set()
+    for group_index, item in enumerate(source):
+        if not isinstance(item, dict):
+            continue
+        group_id = _slug_id(item.get("id") or item.get("name") or f"group-{group_index + 1}")
+        if not group_id or group_id in seen_group_ids:
+            continue
+        seen_group_ids.add(group_id)
+
+        nodes_source = item.get("nodes") if isinstance(item.get("nodes"), list) else []
+        nodes: list[dict[str, object]] = []
+        seen_node_ids: set[str] = set()
+        for node_index, raw_node in enumerate(nodes_source):
+            if not isinstance(raw_node, dict):
+                continue
+            node_id = _slug_id(raw_node.get("id") or raw_node.get("name") or f"node-{node_index + 1}") or f"node-{node_index + 1}"
+            if node_id in seen_node_ids:
+                continue
+            seen_node_ids.add(node_id)
+            nodes.append({
+                "id": node_id,
+                "name": _clean_text(raw_node.get("name")) or node_id,
+                "url": _clean_text(raw_node.get("url")),
+                "enabled": _normalize_bool(raw_node.get("enabled"), True),
+                "image_concurrency_limit": _normalize_proxy_node_image_concurrency_limit(
+                    raw_node.get("image_concurrency_limit")
+                    if raw_node.get("image_concurrency_limit") is not None
+                    else raw_node.get("image_concurrency"),
+                ),
+            })
+
+        groups.append({
+            "id": group_id,
+            "name": _clean_text(item.get("name")) or group_id,
+            "strategy": _clean_text(item.get("strategy")) or "request_random",
+            "rotation_interval_minutes": _normalize_proxy_group_rotation_minutes(item.get("rotation_interval_minutes")),
+            "enabled": _normalize_bool(item.get("enabled"), True),
+            "notes": _clean_text(item.get("notes")),
+            "nodes": nodes,
+        })
+    return groups
 
 
 def _normalize_third_party_apps_settings(value: object) -> dict[str, object]:
@@ -675,6 +760,7 @@ class ConfigStore:
         data["image_storage"] = self.get_image_storage_settings()
         data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
         data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
+        data["proxy_groups"] = self.get_proxy_groups_settings()
         data["third_party_apps"] = self.get_third_party_apps_settings()
         data["image_upstreams"] = self.get_public_image_upstreams_settings()
         data.pop("auth-key", None)
@@ -697,6 +783,9 @@ class ConfigStore:
             clearance["has_cf_cookies"] = bool(cf_cookies)
             clearance["has_cf_clearance"] = bool(cf_clearance)
         return runtime
+
+    def get_proxy_groups_settings(self) -> list[dict[str, object]]:
+        return _normalize_proxy_groups(self.data.get("proxy_groups"))
 
     def get_third_party_apps_settings(self) -> dict[str, object]:
         return _normalize_third_party_apps_settings(self.data.get("third_party_apps"))
@@ -751,6 +840,8 @@ class ConfigStore:
                     incoming_runtime["_existing_cf_cookies"] = previous_clearance.get("cf_cookies")
                     incoming_runtime["_existing_cf_clearance"] = previous_clearance.get("cf_clearance")
             next_data["proxy_runtime"] = _normalize_proxy_runtime_settings(incoming_runtime)
+        if "proxy_groups" in next_data:
+            next_data["proxy_groups"] = _normalize_proxy_groups(next_data.get("proxy_groups"))
         next_data.pop("backup_state", None)
         self.data = next_data
         self._save()

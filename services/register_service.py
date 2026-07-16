@@ -1,75 +1,20 @@
 from __future__ import annotations
 
 import json
-import re
 import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
-from urllib.request import Request, urlopen
 
 from services.account_service import account_service
 from services.config import DATA_DIR
 from services.json_file import read_json_object, write_json_file
-from services.proxy_service import proxy_settings, test_proxy
 from services.register import mail_provider, openai_register
 
 
 REGISTER_FILE = DATA_DIR / "register.json"
-
-_URL_RE = re.compile(r"https?://[^\s<>\"']+")
-_EMAIL_RE = re.compile(r"(?i)\b([a-z0-9._%+-]{1,64})@([a-z0-9.-]+\.[a-z]{2,})\b")
-_CF_RAY_RE = re.compile(r"(?i)\bcf-ray=([a-z0-9-]+)")
-
-
-def _redact_register_log(value: object) -> str:
-    text = str(value or "")
-
-    def redact_url(match: re.Match[str]) -> str:
-        raw = match.group(0)
-        core = raw.rstrip(".,;:!?)]}")
-        trailing = raw[len(core):]
-        try:
-            parsed = urlsplit(core)
-        except ValueError:
-            return f"[url redacted]{trailing}"
-        base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        redacted = f"{base}?[query redacted]" if parsed.query else base
-        return f"{redacted}{trailing}"
-
-    text = _URL_RE.sub(redact_url, text)
-    text = _EMAIL_RE.sub(lambda match: f"{match.group(1)[:2]}***@{match.group(2)}", text)
-    text = re.sub(
-        r"(?i)\b(access_token|refresh_token|id_token|state|nonce|code_verifier)=([^\s,&]+)",
-        r"\1=[redacted]",
-        text,
-    )
-    text = re.sub(r"(?is)\bbody=.*$", "body=[redacted]", text)
-    return text[:1200]
-
-
-def _extract_cf_ray(value: object) -> str:
-    match = _CF_RAY_RE.search(str(value or ""))
-    return str(match.group(1) if match else "").strip()
-
-
-def _extract_status_code(value: object, fallback: object = 0) -> int:
-    try:
-        status_code = int(fallback or 0)
-    except (TypeError, ValueError):
-        status_code = 0
-    if status_code > 0:
-        return status_code
-    match = re.search(r"(?:http_|status=)(\d{3})(?:\D|$)", str(value or ""), flags=re.IGNORECASE)
-    if not match:
-        return 0
-    try:
-        return int(match.group(1))
-    except (TypeError, ValueError):
-        return 0
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -127,76 +72,8 @@ def _ensure_provider_id(provider: dict) -> str:
     return provider_id
 
 
-def _provider_has_value(value: object) -> bool:
-    if isinstance(value, list):
-        return any(str(item or "").strip() for item in value)
-    return bool(str(value or "").strip())
-
-
-def _provider_missing(provider: dict) -> list[str]:
-    """启动前校验邮箱渠道，避免线程启动后才因配置错误失败。"""
-    provider_type = str(provider.get("type") or "").strip()
-    missing: list[str] = []
-
-    def required(key: str, label: str) -> None:
-        if not _provider_has_value(provider.get(key)):
-            missing.append(label)
-
-    if provider_type == "cloudmail_gen":
-        required("api_base", "CloudMail URL")
-        required("admin_email", "管理员邮箱")
-        required("admin_password", "管理员密码")
-        required("domain", "邮箱域名")
-    elif provider_type == "cloudflare_temp_email":
-        required("api_base", "API Base")
-        required("admin_password", "管理员密码")
-        required("domain", "域名")
-    elif provider_type == "moemail":
-        required("api_base", "API Base")
-        required("api_key", "API Key")
-        required("domain", "域名")
-    elif provider_type == "inbucket":
-        required("api_base", "API Base")
-        required("domain", "基础域名")
-    elif provider_type == "duckmail":
-        required("api_key", "API Key")
-    elif provider_type == "gptmail":
-        if str(provider.get("key_mode") or "public") == "custom":
-            required("api_key", "API Key")
-        if _safe_bool(provider.get("local_compose")):
-            required("default_domain", "默认域名")
-    elif provider_type == "donemail":
-        required("api_base", "DoneMail URL")
-        required("admin_key", "Admin Key")
-        required("domain", "域名")
-    elif provider_type == "yyds_mail":
-        required("api_key", "API Key")
-    elif provider_type == "ddg_mail":
-        required("api_base", "CF API Base")
-        required("ddg_token", "DDG Token")
-        required("cf_inbox_jwt", "CF Inbox JWT")
-    elif provider_type == "outlook_token":
-        credentials = mail_provider.parse_outlook_credentials(str(provider.get("mailboxes") or ""))
-        if not credentials and int(provider.get("mailboxes_count") or 0) <= 0:
-            missing.append("Microsoft 邮箱凭据池")
-    return missing
-
-
-def _default_register_diagnostics() -> dict:
-    return {
-        "attempts": 0,
-        "success": 0,
-        "fail": 0,
-        "funnel": {},
-        "providers": {},
-        "egresses": {},
-        "failure_kinds": {},
-        "recent_failures": [],
-    }
-
-
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "trigger_quota": 50, "target_available": 10, "trigger_available": 5, "expected_quota_per_account": 25, "check_interval": 5, "max_attempts": 100, "max_consecutive_failures": 10, "max_runtime_minutes": 60, "retry_cooldown_seconds": 300, "rate_limit_cooldown_seconds": 900, "alert_webhook_url": "", "enabled": False, "history": [], "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0, "phase": "stopped", "stop_reason": "", "last_check_at": "", "next_check_at": "", "channel_health": {}, "diagnostics": _default_register_diagnostics()}}
+    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
 
 
 def _normalize(raw: dict) -> dict:
@@ -206,17 +83,8 @@ def _normalize(raw: dict) -> dict:
     cfg["threads"] = max(1, int(cfg.get("threads") or 1))
     cfg["mode"] = str(cfg.get("mode") or "total").strip() if str(cfg.get("mode") or "total").strip() in {"total", "quota", "available"} else "total"
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
-    cfg["trigger_quota"] = max(0, min(cfg["target_quota"] - 1, int(cfg.get("trigger_quota") if cfg.get("trigger_quota") is not None else cfg["target_quota"] // 2)))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
-    cfg["trigger_available"] = max(0, min(cfg["target_available"] - 1, int(cfg.get("trigger_available") if cfg.get("trigger_available") is not None else cfg["target_available"] // 2)))
-    cfg["expected_quota_per_account"] = max(1, int(cfg.get("expected_quota_per_account") or 25))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
-    cfg["max_attempts"] = max(1, int(cfg.get("max_attempts") or 100))
-    cfg["max_consecutive_failures"] = max(1, int(cfg.get("max_consecutive_failures") or 10))
-    cfg["max_runtime_minutes"] = max(1, int(cfg.get("max_runtime_minutes") or 60))
-    cfg["retry_cooldown_seconds"] = max(30, int(cfg.get("retry_cooldown_seconds") or 300))
-    cfg["rate_limit_cooldown_seconds"] = max(60, int(cfg.get("rate_limit_cooldown_seconds") or 900))
-    cfg["alert_webhook_url"] = str(cfg.get("alert_webhook_url") or "").strip()
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
     mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
@@ -226,10 +94,7 @@ def _normalize(raw: dict) -> dict:
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
-    stats["diagnostics"] = stats.get("diagnostics") if isinstance(stats.get("diagnostics"), dict) else _default_register_diagnostics()
     cfg["stats"] = stats
-    history = raw.get("history") if isinstance(raw.get("history"), list) else []
-    cfg["history"] = [dict(item) for item in history if isinstance(item, dict)][-50:]
     return cfg
 
 
@@ -237,11 +102,8 @@ class RegisterService:
     def __init__(self, store_file: Path):
         self._store_file = store_file
         self._lock = threading.RLock()
-        self._wake_event = threading.Event()
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
-        self._last_pool_log_signature: tuple[object, ...] | None = None
-        self._last_stats_persist_at = 0.0
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -254,22 +116,7 @@ class RegisterService:
         write_json_file(self._store_file, self._config)
 
     def get(self) -> dict:
-        metrics = self._pool_metrics()
         with self._lock:
-            runner_alive = bool(self._runner and self._runner.is_alive())
-            # 进程重启或任务线程异常退出后，不能把持久化状态当成运行中。
-            if self._config.get("enabled") and not runner_alive:
-                self._config["enabled"] = False
-                self._config["stats"]["running"] = 0
-                self._config["stats"]["phase"] = "stopped"
-                self._config["stats"]["next_check_at"] = ""
-                self._save()
-            elif not self._config.get("enabled") and not runner_alive and self._config["stats"].get("phase") == "stopping":
-                self._config["stats"]["running"] = 0
-                self._config["stats"]["phase"] = "stopped"
-                self._config["stats"]["next_check_at"] = ""
-                self._save()
-            self._config["stats"].update(metrics)
             snapshot = json.loads(json.dumps({**self._config, "logs": self._logs[-300:]}, ensure_ascii=False))
         self._redact_outlook_pools(snapshot)
         return snapshot
@@ -404,36 +251,23 @@ class RegisterService:
             self._drop_mail_proxy()
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
             self._save()
-            self._wake_event.set()
             return self.get()
 
     def start(self) -> dict:
         with self._lock:
-            providers = self._config.get("mail", {}).get("providers", []) if isinstance(self._config.get("mail"), dict) else []
-            enabled = [item for item in providers if isinstance(item, dict) and item.get("enable") is not False and str(item.get("type") or "").strip()]
-            if not enabled:
-                raise ValueError("请先配置并启用至少一个邮箱渠道")
-            for index, provider in enumerate(enabled, start=1):
-                missing = _provider_missing(provider)
-                if missing:
-                    label = str(provider.get("label") or f"邮箱来源 {index}").strip()
-                    raise ValueError(f"{label} 缺少：{'、'.join(missing)}")
             if self._runner and self._runner.is_alive():
                 self._config["enabled"] = True
-                self._wake_event.set()
                 self._save()
                 return self.get()
             self._config["enabled"] = True
             self._drop_mail_proxy()
             self._logs = []
-            self._last_pool_log_signature = None
             metrics = self._pool_metrics()
-            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "phase": "starting", "stop_reason": "", "channel_health": {}, "diagnostics": _default_register_diagnostics(), **metrics, "started_at": _now(), "updated_at": _now()}
+            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
             self._save()
-            self._wake_event.clear()
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
@@ -442,35 +276,19 @@ class RegisterService:
     def stop(self) -> dict:
         with self._lock:
             self._config["enabled"] = False
-            self._config["stats"]["phase"] = "stopping"
-            self._config["stats"]["next_check_at"] = ""
             self._config["stats"]["updated_at"] = _now()
             self._save()
-            self._wake_event.set()
             self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
             return self.get()
 
     def reset(self) -> dict:
         with self._lock:
             self._logs = []
-            self._last_pool_log_signature = None
-            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "phase": "stopped", "stop_reason": "", "channel_health": {}, "diagnostics": _default_register_diagnostics(), **self._pool_metrics(), "updated_at": _now()}
+            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
             return self.get()
-
-    def check_now(self) -> dict:
-        with self._lock:
-            enabled = bool(self._config.get("enabled"))
-            self._config["stats"]["next_check_at"] = _now()
-            self._save()
-        self._append_log("已手动触发号池检查", "yellow")
-        if enabled:
-            self._wake_event.set()
-        else:
-            self._target_reached(self.get(), 0)
-        return self.get()
 
     def reset_outlook_pool(self, scope: str = "all") -> dict:
         scope = str(scope or "all").strip().lower()
@@ -511,7 +329,7 @@ class RegisterService:
 
     def _append_log(self, text: str, color: str = "") -> None:
         with self._lock:
-            self._logs.append({"time": _now(), "text": _redact_register_log(text), "level": str(color or "info")})
+            self._logs.append({"time": _now(), "text": str(text), "level": str(color or "info")})
             self._logs = self._logs[-300:]
 
     def _pool_metrics(
@@ -521,272 +339,31 @@ class RegisterService:
         target_quota: int | None = None,
         target_available: int | None = None,
     ) -> dict:
-        evaluate = getattr(account_service, "evaluate_account_pool", None)
-        if callable(evaluate):
-            return evaluate(
-                refresh_stale=refresh_stale,
-                target_quota=target_quota,
-                target_available=target_available,
-            )
+        return account_service.evaluate_account_pool(
+            refresh_stale=refresh_stale,
+            target_quota=target_quota,
+            target_available=target_available,
+        )
 
-        # basketikun 分支没有上游新版的远端号池评估接口，使用现有统计口径兼容。
-        stats = account_service.get_stats()
-        return {
-            "current_quota": max(0, int(stats.get("total_quota") or 0)),
-            "current_available": max(0, int(stats.get("active") or 0)),
-            "estimated_quota": max(0, int(stats.get("total_quota") or 0)),
-            "estimated_available": max(0, int(stats.get("active") or 0)),
-            "pool_refreshed": 0,
-            "pool_refresh_errors": [],
-        }
-
-    def _target_reached(self, cfg: dict, submitted: int, *, refresh_stale: bool = True) -> bool:
+    def _target_reached(self, cfg: dict, submitted: int) -> bool:
         mode = str(cfg.get("mode") or "total")
         metrics = self._pool_metrics(
-            refresh_stale=refresh_stale and mode in {"quota", "available"},
+            refresh_stale=mode in {"quota", "available"},
             target_quota=int(cfg.get("target_quota") or 1) if mode == "quota" else None,
             target_available=int(cfg.get("target_available") or 1) if mode == "available" else None,
         )
-        checked_at = datetime.now(timezone.utc)
-        self._bump(**metrics, last_check_at=checked_at.isoformat())
+        self._bump(**metrics)
         if mode == "quota":
-            target = int(cfg.get("target_quota") or 1)
-            reached = metrics["current_quota"] >= target
-            refill_required = metrics["current_quota"] < target
-            signature = (mode, metrics["current_available"], metrics["current_quota"], target, reached)
-            if signature != self._last_pool_log_signature:
-                self._last_pool_log_signature = signature
-                action = "开始补池" if refill_required else "保持监控"
-                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{action}", "yellow")
+            reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
+            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         if mode == "available":
-            target = int(cfg.get("target_available") or 1)
-            reached = metrics["current_available"] >= target
-            refill_required = metrics["current_available"] < target
-            signature = (mode, metrics["current_available"], metrics["current_quota"], target, reached)
-            if signature != self._last_pool_log_signature:
-                self._last_pool_log_signature = signature
-                action = "开始补池" if refill_required else "保持监控"
-                self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{action}", "yellow")
+            reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
+            self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，目标账号={cfg.get('target_available')}，当前剩余额度={metrics['current_quota']}，{'跳过注册' if reached else '继续注册'}", "yellow")
             return reached
         return submitted >= int(cfg.get("total") or 1)
 
-    def _refill_required(self, cfg: dict) -> bool:
-        stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
-        mode = str(cfg.get("mode") or "total")
-        if mode == "quota":
-            target = int(cfg.get("target_quota") or 1)
-            return int(stats.get("current_quota") or 0) < target
-        if mode == "available":
-            target = int(cfg.get("target_available") or 1)
-            return int(stats.get("current_available") or 0) < target
-        return True
-
-    def _concurrency_limit(self, cfg: dict, threads: int) -> int:
-        stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
-        mode = str(cfg.get("mode") or "total")
-        if mode == "quota":
-            deficit = max(0, int(cfg.get("target_quota") or 1) - int(stats.get("current_quota") or 0))
-            expected = max(1, int(cfg.get("expected_quota_per_account") or 25))
-            needed = max(1, (deficit + expected - 1) // expected)
-            return min(threads, needed)
-        if mode == "available":
-            deficit = max(0, int(cfg.get("target_available") or 1) - int(stats.get("current_available") or 0))
-            return min(threads, max(1, deficit))
-        return threads
-
-    def _start_cycle_record(self, cfg: dict, success: int, fail: int) -> dict:
-        stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
-        mode = str(cfg.get("mode") or "quota")
-        return {
-            "id": uuid.uuid4().hex,
-            "mode": mode,
-            "started_at": _now(),
-            "start_quota": int(stats.get("current_quota") or 0),
-            "start_available": int(stats.get("current_available") or 0),
-            "target": int(cfg.get("target_quota") if mode == "quota" else cfg.get("target_available") or 0),
-            "trigger": int(cfg.get("target_quota") if mode == "quota" else cfg.get("target_available") or 0),
-            "_success_start": success,
-            "_fail_start": fail,
-        }
-
-    def _finish_cycle_record(self, record: dict | None, status: str, reason: str, success: int, fail: int) -> None:
-        if not record:
-            return
-        stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
-        item = {key: value for key, value in record.items() if not key.startswith("_")}
-        item.update({
-            "status": status,
-            "reason": reason,
-            "finished_at": _now(),
-            "end_quota": int(stats.get("current_quota") or 0),
-            "end_available": int(stats.get("current_available") or 0),
-            "success": max(0, success - int(record.get("_success_start") or 0)),
-            "fail": max(0, fail - int(record.get("_fail_start") or 0)),
-        })
-        with self._lock:
-            self._config["history"] = [*(self._config.get("history") or []), item][-50:]
-            self._save()
-        if status in {"cooldown", "failed"}:
-            self._notify({"event": "register_refill_cycle_failed", **item})
-
-    def _update_channel_health(self, result: dict) -> None:
-        if str(result.get("failure_kind") or "") == "rate_limit":
-            return
-        payload = result.get("result") if isinstance(result.get("result"), dict) else {}
-        provider = str(payload.get("register_provider") or result.get("provider") or "unknown").strip() or "unknown"
-        with self._lock:
-            stats = self._config["stats"]
-            health = stats.get("channel_health") if isinstance(stats.get("channel_health"), dict) else {}
-            item = dict(health.get(provider) if isinstance(health.get(provider), dict) else {})
-            ok = bool(result.get("ok"))
-            item["success" if ok else "fail"] = int(item.get("success" if ok else "fail") or 0) + 1
-            item["last_at"] = _now()
-            item["last_error"] = "" if ok else _redact_register_log(result.get("error") or "注册失败")[:300]
-            health[provider] = item
-            stats["channel_health"] = health
-
-    def _record_attempt_diagnostics(self, result: dict) -> None:
-        payload = result.get("result") if isinstance(result.get("result"), dict) else {}
-        attempt = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
-        provider = str(payload.get("register_provider") or result.get("provider") or "unknown").strip() or "unknown"
-        flow = str(attempt.get("flow") or "unknown").strip() or "unknown"
-        failure_stage = str(attempt.get("failure_stage") or "").strip()
-        duration_ms = max(0, int(result.get("duration_ms") or attempt.get("duration_ms") or 0))
-        failure_kind = str(result.get("failure_kind") or "").strip()
-        proxy_label = str(attempt.get("proxy_label") or attempt.get("proxy_source") or "direct").strip() or "direct"
-        proxy_source = str(attempt.get("proxy_source") or "direct").strip() or "direct"
-        egress_mode = str(attempt.get("egress_mode") or "direct").strip() or "direct"
-        clearance_mode = str(attempt.get("clearance_mode") or "none").strip() or "none"
-        clearance_enabled = bool(attempt.get("clearance_enabled"))
-        clearance_refresh_attempts = max(0, int(attempt.get("clearance_refresh_attempts") or 0))
-        clearance_refresh_success = max(0, int(attempt.get("clearance_refresh_success") or 0))
-        status_code = _extract_status_code(result.get("error"), result.get("status_code"))
-        cf_ray = _extract_cf_ray(result.get("error"))
-        error_text = _redact_register_log(result.get("error") or "registration_failed")[:300]
-        cloudflare_blocked = "cloudflare" in str(result.get("error") or "").lower()
-        stage_names = [
-            str(name).strip()
-            for name in (attempt.get("stage_order") if isinstance(attempt.get("stage_order"), list) else [])
-            if str(name).strip()
-        ]
-        stage_payloads = attempt.get("stages") if isinstance(attempt.get("stages"), dict) else {}
-
-        with self._lock:
-            stats = self._config["stats"]
-            diagnostics = stats.get("diagnostics") if isinstance(stats.get("diagnostics"), dict) else _default_register_diagnostics()
-            diagnostics["attempts"] = max(0, int(diagnostics.get("attempts") or 0)) + 1
-            outcome_key = "success" if result.get("ok") else "fail"
-            diagnostics[outcome_key] = max(0, int(diagnostics.get(outcome_key) or 0)) + 1
-
-            funnel = diagnostics.get("funnel") if isinstance(diagnostics.get("funnel"), dict) else {}
-            for stage_name in stage_names:
-                raw_stage = stage_payloads.get(stage_name) if isinstance(stage_payloads.get(stage_name), dict) else {}
-                stage_attempts = max(1, int(raw_stage.get("attempts") or 1))
-                stage_duration = max(0, int(raw_stage.get("duration_ms") or raw_stage.get("last_duration_ms") or 0))
-                stage_ok = bool(raw_stage.get("ok"))
-                entry = dict(funnel.get(stage_name) if isinstance(funnel.get(stage_name), dict) else {})
-                entry["reached"] = max(0, int(entry.get("reached") or 0)) + 1
-                entry["success" if stage_ok else "fail"] = max(0, int(entry.get("success" if stage_ok else "fail") or 0)) + 1
-                entry["retries"] = max(0, int(entry.get("retries") or 0)) + max(0, stage_attempts - 1)
-                entry["total_duration_ms"] = max(0, int(entry.get("total_duration_ms") or 0)) + stage_duration
-                reached = max(1, int(entry.get("reached") or 1))
-                entry["avg_duration_ms"] = round(int(entry["total_duration_ms"]) / reached, 1)
-                funnel[stage_name] = entry
-            diagnostics["funnel"] = funnel
-
-            providers = diagnostics.get("providers") if isinstance(diagnostics.get("providers"), dict) else {}
-            provider_entry = dict(providers.get(provider) if isinstance(providers.get(provider), dict) else {})
-            provider_entry[outcome_key] = max(0, int(provider_entry.get(outcome_key) or 0)) + 1
-            provider_entry["total_duration_ms"] = max(0, int(provider_entry.get("total_duration_ms") or 0)) + duration_ms
-            provider_total = max(1, int(provider_entry.get("success") or 0) + int(provider_entry.get("fail") or 0))
-            provider_entry["avg_duration_ms"] = round(int(provider_entry["total_duration_ms"]) / provider_total, 1)
-            provider_entry["last_at"] = _now()
-            provider_entry["last_flow"] = flow
-            if result.get("ok"):
-                provider_entry["last_error"] = ""
-            else:
-                provider_entry["last_error"] = error_text
-                failure_stages = dict(provider_entry.get("failure_stages") if isinstance(provider_entry.get("failure_stages"), dict) else {})
-                stage_key = failure_stage or "unknown"
-                failure_stages[stage_key] = max(0, int(failure_stages.get(stage_key) or 0)) + 1
-                provider_entry["failure_stages"] = failure_stages
-            providers[provider] = provider_entry
-            diagnostics["providers"] = providers
-
-            egresses = diagnostics.get("egresses") if isinstance(diagnostics.get("egresses"), dict) else {}
-            egress_entry = dict(egresses.get(proxy_label) if isinstance(egresses.get(proxy_label), dict) else {})
-            egress_entry[outcome_key] = max(0, int(egress_entry.get(outcome_key) or 0)) + 1
-            egress_entry["total_duration_ms"] = max(0, int(egress_entry.get("total_duration_ms") or 0)) + duration_ms
-            egress_total = max(1, int(egress_entry.get("success") or 0) + int(egress_entry.get("fail") or 0))
-            egress_entry["avg_duration_ms"] = round(int(egress_entry["total_duration_ms"]) / egress_total, 1)
-            egress_entry["last_at"] = _now()
-            egress_entry["last_flow"] = flow
-            egress_entry["proxy_source"] = proxy_source
-            egress_entry["egress_mode"] = egress_mode
-            egress_entry["clearance_mode"] = clearance_mode
-            egress_entry["clearance_enabled"] = clearance_enabled
-            egress_entry["clearance_refresh_attempts"] = max(0, int(egress_entry.get("clearance_refresh_attempts") or 0)) + clearance_refresh_attempts
-            egress_entry["clearance_refresh_success"] = max(0, int(egress_entry.get("clearance_refresh_success") or 0)) + clearance_refresh_success
-            if status_code:
-                status_codes = dict(egress_entry.get("status_codes") if isinstance(egress_entry.get("status_codes"), dict) else {})
-                status_key = str(status_code)
-                status_codes[status_key] = max(0, int(status_codes.get(status_key) or 0)) + 1
-                egress_entry["status_codes"] = status_codes
-                egress_entry["last_status_code"] = status_code
-            if cf_ray:
-                egress_entry["last_cf_ray"] = cf_ray
-            if cloudflare_blocked:
-                egress_entry["cloudflare_blocks"] = max(0, int(egress_entry.get("cloudflare_blocks") or 0)) + 1
-            if result.get("ok"):
-                egress_entry["last_error"] = ""
-            else:
-                egress_entry["last_error"] = error_text
-            egresses[proxy_label] = egress_entry
-            diagnostics["egresses"] = egresses
-
-            if failure_kind:
-                failure_kinds = diagnostics.get("failure_kinds") if isinstance(diagnostics.get("failure_kinds"), dict) else {}
-                failure_kinds[failure_kind] = max(0, int(failure_kinds.get(failure_kind) or 0)) + 1
-                diagnostics["failure_kinds"] = failure_kinds
-
-            if not result.get("ok"):
-                recent_failures = list(diagnostics.get("recent_failures") if isinstance(diagnostics.get("recent_failures"), list) else [])
-                recent_failures.append({
-                    "at": _now(),
-                    "provider": provider,
-                    "flow": flow,
-                    "stage": failure_stage or "unknown",
-                    "failure_kind": failure_kind or "registration_error",
-                    "error": error_text,
-                    "duration_ms": duration_ms,
-                    "proxy_label": proxy_label,
-                    "proxy_source": proxy_source,
-                    "clearance_mode": clearance_mode,
-                    "status_code": status_code,
-                    "cf_ray": cf_ray,
-                })
-                diagnostics["recent_failures"] = recent_failures[-20:]
-
-            stats["diagnostics"] = diagnostics
-
-    def _notify(self, payload: dict) -> None:
-        webhook_url = str(self._config.get("alert_webhook_url") or "").strip()
-        if not webhook_url.startswith(("http://", "https://")):
-            return
-
-        def send() -> None:
-            try:
-                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-                with urlopen(Request(webhook_url, data=body, headers={"Content-Type": "application/json"}, method="POST"), timeout=5):
-                    pass
-            except Exception:
-                pass
-
-        threading.Thread(target=send, daemon=True, name="register-alert").start()
-
     def _bump(self, **updates) -> None:
-        force_persist = bool(updates.pop("_persist", False))
         with self._lock:
             self._config["stats"].update(updates)
             stats = self._config["stats"]
@@ -803,256 +380,36 @@ class RegisterService:
                 stats["avg_seconds"] = round(elapsed / success, 1) if success else 0
                 stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
             self._config["stats"]["updated_at"] = _now()
-            now = time.monotonic()
-            if force_persist or now - self._last_stats_persist_at >= 2.0:
-                self._save()
-                self._last_stats_persist_at = now
-
-    @staticmethod
-    def _safety_stop_reason(cfg: dict, submitted: int, consecutive_failures: int, started_at: float) -> str:
-        if submitted >= int(cfg.get("max_attempts") or 100):
-            return f"达到最大尝试次数 {int(cfg.get('max_attempts') or 100)}"
-        if consecutive_failures >= int(cfg.get("max_consecutive_failures") or 10):
-            return f"连续失败 {int(cfg.get('max_consecutive_failures') or 10)} 次"
-        max_seconds = int(cfg.get("max_runtime_minutes") or 60) * 60
-        if time.monotonic() - started_at >= max_seconds:
-            return f"达到最长运行时间 {int(cfg.get('max_runtime_minutes') or 60)} 分钟"
-        return ""
-
-    def _finish_running_state(self, reason: str) -> None:
-        with self._lock:
-            self._config["enabled"] = False
-            self._config["stats"]["phase"] = "stopped"
-            self._config["stats"]["stop_reason"] = reason
-            self._config["stats"]["next_check_at"] = ""
-            self._config["stats"]["updated_at"] = _now()
             self._save()
-        if reason:
-            self._append_log(f"注册任务自动停止：{reason}", "yellow")
-
-    def _set_phase(self, phase: str, reason: str = "") -> bool:
-        with self._lock:
-            stats = self._config["stats"]
-            changed = stats.get("phase") != phase or str(stats.get("stop_reason") or "") != reason
-            stats["phase"] = phase
-            stats["stop_reason"] = reason
-            if phase not in {"monitoring", "cooldown"}:
-                stats["next_check_at"] = ""
-            stats["updated_at"] = _now()
-            if changed:
-                self._save()
-            return changed
-
-    def _schedule_next_check(self, seconds: float) -> None:
-        delay = max(0.0, float(seconds))
-        deadline = datetime.now(timezone.utc) + timedelta(seconds=delay)
-        self._bump(_persist=True, next_check_at=deadline.isoformat())
-
-    def _wait_for_next_check(self, seconds: float) -> None:
-        self._wake_event.wait(timeout=max(0.1, float(seconds)))
-        self._wake_event.clear()
-
-    def _proxy_preflight(self) -> dict[str, object]:
-        register_proxy = str(self._config.get("proxy") or "").strip()
-        profile = proxy_settings.get_profile(proxy=register_proxy, upstream=True)
-        if not profile.proxy_url:
-            return {"ok": True, "skipped": True, "proxy_source": profile.proxy_source}
-        result = test_proxy(profile.proxy_url, timeout=10.0)
-        if not result.get("ok"):
-            return result
-        clearance = profile.clearance
-        if profile.clearance_mode == "flaresolverr":
-            bundle = proxy_settings.refresh_clearance(
-                target_url="https://auth.openai.com",
-                proxy=profile.proxy_url,
-                force=True,
-                upstream=True,
-            )
-            if bundle is None:
-                # FlareSolverr 在目标页没有挑战时可能返回 200 但不带 clearance。
-                # 代理本身可用时继续执行，由实际注册请求按需处理 403，避免整轮任务被误判为代理故障。
-                return {
-                    **result,
-                    "clearance_ok": False,
-                    "clearance_warning": "FlareSolverr 预检未返回 Cookie，将在请求遇到 Cloudflare 时按需重试",
-                    "proxy_source": profile.proxy_source,
-                    "clearance": clearance,
-                }
-            result = {
-                **result,
-                "clearance_ok": True,
-                "proxy_source": profile.proxy_source,
-                "clearance": clearance,
-            }
-        return result
 
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
-        cycle_submitted = 0
-        cycle_consecutive_failures = 0
-        cycle_started_monotonic: float | None = None
-        runner_started_monotonic = time.monotonic()
-        retry_not_before = 0.0
-        stop_reason = ""
-        cycle_record: dict | None = None
-        cycle_block_reason = ""
-        cycle_block_cooldown = 0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
                 cfg = self.get()
-                enabled = bool(cfg.get("enabled"))
-                mode = str(cfg.get("mode") or "total")
-                monitor_mode = mode in {"quota", "available"}
-                now = time.monotonic()
-
-                if monitor_mode and enabled and not futures and now < retry_not_before:
-                    current_reason = str((cfg.get("stats") or {}).get("stop_reason") or "本轮补池失败，等待重试")
-                    self._set_phase("cooldown", current_reason)
-                    self._wait_for_next_check(min(1.0, retry_not_before - now))
-                    continue
-
-                reached = self._target_reached(cfg, submitted, refresh_stale=not futures)
-                refill_required = self._refill_required(cfg) if monitor_mode else True
-
-                if monitor_mode and enabled and not futures:
-                    cycle_active = cycle_started_monotonic is not None
-                    if cycle_active and reached:
-                        self._finish_cycle_record(cycle_record, "completed", "已达到补池目标", success, fail)
-                        cycle_record = None
-                        cycle_submitted = 0
-                        cycle_consecutive_failures = 0
-                        cycle_started_monotonic = None
-                        retry_not_before = 0.0
-                    if (not cycle_active and not refill_required) or reached:
-                        if self._set_phase("monitoring"):
-                            self._append_log("号池处于安全区间，进入常驻监控", "green")
-                        wait_seconds = int(cfg.get("check_interval") or 5)
-                        self._bump(running=0, done=done, success=success, fail=fail)
-                        self._schedule_next_check(wait_seconds)
-                        self._wait_for_next_check(wait_seconds)
-                        continue
-
-                if enabled and not reached and not futures and cycle_started_monotonic is None:
-                    proxy_check = self._proxy_preflight()
-                    if not proxy_check.get("ok"):
-                        error = _redact_register_log(proxy_check.get("error") or "代理不可用")
-                        reason = f"代理预检失败：{error}"
-                        if monitor_mode:
-                            cooldown_seconds = int(cfg.get("retry_cooldown_seconds") or 300)
-                            retry_not_before = now + cooldown_seconds
-                            cooldown_reason = f"{reason}，冷却后自动重试"
-                            self._schedule_next_check(cooldown_seconds)
-                            if self._set_phase("cooldown", cooldown_reason):
-                                self._append_log(cooldown_reason, "yellow")
-                            self._bump(running=0, done=done, success=success, fail=fail)
-                            self._wait_for_next_check(min(1.0, retry_not_before - now))
-                            continue
-                        stop_reason = reason
-                        self._finish_running_state(stop_reason)
-                        break
-
-                if monitor_mode and enabled and not reached and cycle_started_monotonic is None:
-                    cycle_started_monotonic = now
-                    cycle_submitted = 0
-                    cycle_consecutive_failures = 0
-                    retry_not_before = 0.0
-                    cycle_block_reason = ""
-                    cycle_block_cooldown = 0
-                    cycle_record = self._start_cycle_record(cfg, success, fail)
-                    if self._set_phase("registering"):
-                        self._append_log("检测到号池低于目标，开始自动补池", "yellow")
-
-                safety_submitted = cycle_submitted if monitor_mode else submitted
-                safety_started = (cycle_started_monotonic or now) if monitor_mode else runner_started_monotonic
-                safety_reason = cycle_block_reason or self._safety_stop_reason(cfg, safety_submitted, cycle_consecutive_failures, safety_started)
-                if enabled and safety_reason:
-                    if monitor_mode:
-                        if not futures:
-                            cooldown_seconds = cycle_block_cooldown or int(cfg.get("retry_cooldown_seconds") or 300)
-                            retry_not_before = now + cooldown_seconds
-                            reason = f"本轮补池暂停：{safety_reason}，{cooldown_seconds} 秒后自动重试"
-                            self._schedule_next_check(cooldown_seconds)
-                            if self._set_phase("cooldown", reason):
-                                self._append_log(reason, "yellow")
-                            self._finish_cycle_record(cycle_record, "cooldown", reason, success, fail)
-                            cycle_record = None
-                            cycle_submitted = 0
-                            cycle_consecutive_failures = 0
-                            cycle_started_monotonic = None
-                            cycle_block_reason = ""
-                            cycle_block_cooldown = 0
-                            self._wait_for_next_check(min(1.0, retry_not_before - now))
-                            continue
-                    else:
-                        stop_reason = safety_reason
-                        self._finish_running_state(stop_reason)
-                        enabled = False
-                max_attempts = int(cfg.get("max_attempts") or 100)
-                attempt_count = cycle_submitted if monitor_mode else submitted
-                concurrency_limit = self._concurrency_limit(cfg, threads)
-                remaining_failure_budget = max(0, int(cfg.get("max_consecutive_failures") or 10) - cycle_consecutive_failures)
-                concurrency_limit = min(concurrency_limit, remaining_failure_budget)
-                while enabled and not reached and not safety_reason and len(futures) < concurrency_limit and attempt_count < max_attempts:
+                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
-                    if monitor_mode:
-                        cycle_submitted += 1
-                        attempt_count = cycle_submitted
-                    else:
-                        attempt_count = submitted
                     futures.add(executor.submit(openai_register.worker, submitted))
-                    if mode == "total":
-                        reached = submitted >= int(cfg.get("total") or 1)
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
-                if not futures and not enabled:
-                    break
-                if not futures and reached:
-                    if mode == "total":
-                        stop_reason = "已达到任务目标"
-                        self._finish_running_state(stop_reason)
-                        break
-                    continue
-                if not futures and mode == "total":
+                if not futures and (not self.get()["enabled"] or str(cfg.get("mode") or "total") == "total"):
                     break
                 if not futures:
-                    self._wait_for_next_check(int(cfg.get("check_interval") or 5))
+                    time.sleep(max(1, int(cfg.get("check_interval") or 5)))
                     continue
-                finished, futures = wait(futures, timeout=1.0, return_when=FIRST_COMPLETED)
-                batch_success = False
-                batch_failures = 0
+                finished, futures = wait(futures, return_when=FIRST_COMPLETED)
                 for future in finished:
                     done += 1
                     try:
                         result = future.result()
-                        self._update_channel_health(result)
-                        self._record_attempt_diagnostics(result)
-                        if result.get("ok"):
-                            success += 1
-                            batch_success = True
-                        else:
-                            fail += 1
-                            batch_failures += 1
-                            if str(result.get("failure_kind") or "") == "rate_limit" and not cycle_block_reason:
-                                retry_after = max(0, int(result.get("retry_after") or 0))
-                                configured_cooldown = int(cfg.get("rate_limit_cooldown_seconds") or 900)
-                                cycle_block_reason = "注册出口触发上游限流（HTTP 429）"
-                                cycle_block_cooldown = max(configured_cooldown, retry_after)
+                        success += 1 if result.get("ok") else 0
+                        fail += 0 if result.get("ok") else 1
                     except Exception:
                         fail += 1
-                        batch_failures += 1
-                if batch_success:
-                    cycle_consecutive_failures = 0
-                else:
-                    cycle_consecutive_failures += batch_failures
         self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
-        self._finish_cycle_record(cycle_record, "stopped", "任务已停止", success, fail)
         with self._lock:
             self._config["enabled"] = False
-            self._config["stats"]["phase"] = "stopped"
-            self._config["stats"]["next_check_at"] = ""
-            if stop_reason:
-                self._config["stats"]["stop_reason"] = stop_reason
             self._save()
         self._append_log(f"注册任务结束，成功{success}，失败{fail}", "yellow")
 

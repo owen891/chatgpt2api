@@ -17,15 +17,24 @@ from services.proxy_service import (
 
 
 class FakeConfig:
-    def __init__(self, legacy_proxy: str = "", runtime: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        legacy_proxy: str = "",
+        runtime: dict[str, object] | None = None,
+        proxy_groups: list[dict[str, object]] | None = None,
+    ) -> None:
         self.legacy_proxy = legacy_proxy
         self.runtime = runtime if runtime is not None else copy.deepcopy(DEFAULT_PROXY_RUNTIME)
+        self.proxy_groups = copy.deepcopy(proxy_groups or [])
 
     def get_proxy_settings(self) -> str:
         return self.legacy_proxy
 
     def get_proxy_runtime_settings(self) -> dict[str, object]:
         return copy.deepcopy(self.runtime)
+
+    def get_proxy_groups_settings(self) -> list[dict[str, object]]:
+        return copy.deepcopy(self.proxy_groups)
 
 
 def make_runtime(**overrides: object) -> dict[str, object]:
@@ -89,6 +98,25 @@ class ProxyServiceTests(unittest.TestCase):
         kwargs = store.build_session_kwargs(proxy=" socks5://explicit.example:1080 ")
 
         self.assertEqual(kwargs["proxy"], "socks5h://explicit.example:1080")
+
+    def test_group_reference_resolves_to_enabled_group_node(self) -> None:
+        store = ProxySettingsStore(FakeConfig(proxy_groups=[
+            {
+                "id": "hk-pool",
+                "name": "HK Pool",
+                "enabled": True,
+                "nodes": [
+                    {"id": "node-a", "name": "node-a", "url": "http://127.0.0.1:7890", "enabled": True},
+                ],
+            }
+        ]))
+
+        profile = store.get_profile(proxy="group:hk-pool")
+
+        self.assertEqual(profile.proxy_url, "http://127.0.0.1:7890")
+        self.assertEqual(profile.proxy_source, "explicit_group")
+        self.assertEqual(profile.proxy_group_id, "hk-pool")
+        self.assertEqual(profile.proxy_node_id, "node-a")
 
     def test_resource_requests_use_resource_proxy_url_when_configured(self) -> None:
         runtime = make_runtime(

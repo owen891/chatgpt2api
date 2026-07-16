@@ -135,6 +135,7 @@ class ImageUpstreamService:
         max_attempts = int(self._settings().get("max_attempts") or 2)
         request_attempts = 0
         last_archive_error: ImageGenerationError | None = None
+        last_archive_fallback_result: dict[str, Any] | None = None
         for channel, upstream_model in candidates:
             state = self._circuits.get(str(channel["id"]))
             if state and state.opened_until > time.time():
@@ -182,6 +183,14 @@ class ImageUpstreamService:
                             if isinstance(item, dict) and str(item.get("url") or "").strip()
                         ]
                         if enriched:
+                            fallback_result = self._fallback_result_from_pending(response, enriched)
+                            if fallback_result is not None:
+                                fallback_result["_image_pending_archive"] = enriched
+                                fallback_result["_image_upstream_selected"] = str(channel.get("name") or channel.get("id"))
+                                last_archive_fallback_result = fallback_result
+                                if request_attempts >= max_attempts:
+                                    fallback_result["_image_upstream_attempts"] = attempts
+                                    return fallback_result
                             last_archive_error = exc
                             setattr(exc, "image_pending_archive", enriched)
                             body["_image_pending_archive"] = enriched
@@ -221,12 +230,39 @@ class ImageUpstreamService:
             error = ImageGenerationError(message, status_code=status, error_type="server_error", code="image_upstream_error")
             setattr(error, "image_upstream_attempts", attempts)
             raise error
+        if last_archive_fallback_result is not None:
+            last_archive_fallback_result["_image_upstream_attempts"] = attempts
+            return last_archive_fallback_result
         if last_archive_error is not None:
             body["_image_upstream_attempts"] = attempts
             setattr(last_archive_error, "image_upstream_attempts", attempts)
             raise last_archive_error
         body["_image_upstream_attempts"] = attempts
         return None
+
+    def _fallback_result_from_pending(
+        self,
+        response: requests.Response,
+        pending: list[dict[str, object]],
+    ) -> dict[str, Any] | None:
+        data: list[dict[str, object]] = []
+        for item in pending:
+            url = str(item.get("url") or "").strip()
+            if not url:
+                continue
+            result: dict[str, object] = {"url": url}
+            revised_prompt = str(item.get("revised_prompt") or "").strip()
+            if revised_prompt:
+                result["revised_prompt"] = revised_prompt
+            data.append(result)
+        if not data:
+            return None
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
+        created = int(payload.get("created") or time.time()) if isinstance(payload, dict) else int(time.time())
+        return {"created": created, "data": data}
 
     def archive_pending(self, pending: list[dict[str, object]], *, base_url: str = "") -> dict[str, Any]:
         """重新下载并归档已生成的图片，不重新调用上游生图。"""
