@@ -22,6 +22,7 @@ REGISTER_FILE = DATA_DIR / "register.json"
 
 _URL_RE = re.compile(r"https?://[^\s<>\"']+")
 _EMAIL_RE = re.compile(r"(?i)\b([a-z0-9._%+-]{1,64})@([a-z0-9.-]+\.[a-z]{2,})\b")
+_CF_RAY_RE = re.compile(r"(?i)\bcf-ray=([a-z0-9-]+)")
 
 
 def _redact_register_log(value: object) -> str:
@@ -48,6 +49,27 @@ def _redact_register_log(value: object) -> str:
     )
     text = re.sub(r"(?is)\bbody=.*$", "body=[redacted]", text)
     return text[:1200]
+
+
+def _extract_cf_ray(value: object) -> str:
+    match = _CF_RAY_RE.search(str(value or ""))
+    return str(match.group(1) if match else "").strip()
+
+
+def _extract_status_code(value: object, fallback: object = 0) -> int:
+    try:
+        status_code = int(fallback or 0)
+    except (TypeError, ValueError):
+        status_code = 0
+    if status_code > 0:
+        return status_code
+    match = re.search(r"(?:http_|status=)(\d{3})(?:\D|$)", str(value or ""), flags=re.IGNORECASE)
+    if not match:
+        return 0
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _serialize_outlook_pool(credentials: list[dict]) -> str:
@@ -160,8 +182,21 @@ def _provider_missing(provider: dict) -> list[str]:
     return missing
 
 
+def _default_register_diagnostics() -> dict:
+    return {
+        "attempts": 0,
+        "success": 0,
+        "fail": 0,
+        "funnel": {},
+        "providers": {},
+        "egresses": {},
+        "failure_kinds": {},
+        "recent_failures": [],
+    }
+
+
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "trigger_quota": 50, "target_available": 10, "trigger_available": 5, "expected_quota_per_account": 25, "check_interval": 5, "max_attempts": 100, "max_consecutive_failures": 10, "max_runtime_minutes": 60, "retry_cooldown_seconds": 300, "rate_limit_cooldown_seconds": 900, "alert_webhook_url": "", "enabled": False, "history": [], "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0, "phase": "stopped", "stop_reason": "", "last_check_at": "", "next_check_at": "", "channel_health": {}}}
+    return {**openai_register.config, "mode": "total", "target_quota": 100, "trigger_quota": 50, "target_available": 10, "trigger_available": 5, "expected_quota_per_account": 25, "check_interval": 5, "max_attempts": 100, "max_consecutive_failures": 10, "max_runtime_minutes": 60, "retry_cooldown_seconds": 300, "rate_limit_cooldown_seconds": 900, "alert_webhook_url": "", "enabled": False, "history": [], "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0, "phase": "stopped", "stop_reason": "", "last_check_at": "", "next_check_at": "", "channel_health": {}, "diagnostics": _default_register_diagnostics()}}
 
 
 def _normalize(raw: dict) -> dict:
@@ -191,6 +226,7 @@ def _normalize(raw: dict) -> dict:
     cfg["enabled"] = bool(cfg.get("enabled"))
     stats = {**_default_config()["stats"], **(raw.get("stats") if isinstance(raw.get("stats"), dict) else {}),
              "threads": cfg["threads"]}
+    stats["diagnostics"] = stats.get("diagnostics") if isinstance(stats.get("diagnostics"), dict) else _default_register_diagnostics()
     cfg["stats"] = stats
     history = raw.get("history") if isinstance(raw.get("history"), list) else []
     cfg["history"] = [dict(item) for item in history if isinstance(item, dict)][-50:]
@@ -205,6 +241,7 @@ class RegisterService:
         self._runner: threading.Thread | None = None
         self._logs: list[dict] = []
         self._last_pool_log_signature: tuple[object, ...] | None = None
+        self._last_stats_persist_at = 0.0
         openai_register.register_log_sink = self._append_log
         self._config = self._load()
         if self._config["enabled"]:
@@ -391,7 +428,7 @@ class RegisterService:
             self._logs = []
             self._last_pool_log_signature = None
             metrics = self._pool_metrics()
-            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "phase": "starting", "stop_reason": "", **metrics, "started_at": _now(), "updated_at": _now()}
+            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "phase": "starting", "stop_reason": "", "channel_health": {}, "diagnostics": _default_register_diagnostics(), **metrics, "started_at": _now(), "updated_at": _now()}
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
@@ -417,7 +454,7 @@ class RegisterService:
         with self._lock:
             self._logs = []
             self._last_pool_log_signature = None
-            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "phase": "stopped", "stop_reason": "", **self._pool_metrics(), "updated_at": _now()}
+            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "phase": "stopped", "stop_reason": "", "channel_health": {}, "diagnostics": _default_register_diagnostics(), **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
@@ -513,18 +550,20 @@ class RegisterService:
         checked_at = datetime.now(timezone.utc)
         self._bump(**metrics, last_check_at=checked_at.isoformat())
         if mode == "quota":
-            reached = metrics["current_quota"] >= int(cfg.get("target_quota") or 1)
-            refill_required = not reached
-            signature = (mode, metrics["current_available"], metrics["current_quota"], int(cfg.get("target_quota") or 1), reached)
+            target = int(cfg.get("target_quota") or 1)
+            reached = metrics["current_quota"] >= target
+            refill_required = metrics["current_quota"] < target
+            signature = (mode, metrics["current_available"], metrics["current_quota"], target, reached)
             if signature != self._last_pool_log_signature:
                 self._last_pool_log_signature = signature
                 action = "开始补池" if refill_required else "保持监控"
                 self._append_log(f"检查号池：当前正常账号={metrics['current_available']}，当前剩余额度={metrics['current_quota']}，目标额度={cfg.get('target_quota')}，{action}", "yellow")
             return reached
         if mode == "available":
-            reached = metrics["current_available"] >= int(cfg.get("target_available") or 1)
-            refill_required = not reached
-            signature = (mode, metrics["current_available"], metrics["current_quota"], int(cfg.get("target_available") or 1), reached)
+            target = int(cfg.get("target_available") or 1)
+            reached = metrics["current_available"] >= target
+            refill_required = metrics["current_available"] < target
+            signature = (mode, metrics["current_available"], metrics["current_quota"], target, reached)
             if signature != self._last_pool_log_signature:
                 self._last_pool_log_signature = signature
                 action = "开始补池" if refill_required else "保持监控"
@@ -536,9 +575,11 @@ class RegisterService:
         stats = self._config.get("stats") if isinstance(self._config.get("stats"), dict) else {}
         mode = str(cfg.get("mode") or "total")
         if mode == "quota":
-            return int(stats.get("current_quota") or 0) < int(cfg.get("target_quota") or 1)
+            target = int(cfg.get("target_quota") or 1)
+            return int(stats.get("current_quota") or 0) < target
         if mode == "available":
-            return int(stats.get("current_available") or 0) < int(cfg.get("target_available") or 1)
+            target = int(cfg.get("target_available") or 1)
+            return int(stats.get("current_available") or 0) < target
         return True
 
     def _concurrency_limit(self, cfg: dict, threads: int) -> int:
@@ -605,6 +646,130 @@ class RegisterService:
             health[provider] = item
             stats["channel_health"] = health
 
+    def _record_attempt_diagnostics(self, result: dict) -> None:
+        payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+        attempt = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
+        provider = str(payload.get("register_provider") or result.get("provider") or "unknown").strip() or "unknown"
+        flow = str(attempt.get("flow") or "unknown").strip() or "unknown"
+        failure_stage = str(attempt.get("failure_stage") or "").strip()
+        duration_ms = max(0, int(result.get("duration_ms") or attempt.get("duration_ms") or 0))
+        failure_kind = str(result.get("failure_kind") or "").strip()
+        proxy_label = str(attempt.get("proxy_label") or attempt.get("proxy_source") or "direct").strip() or "direct"
+        proxy_source = str(attempt.get("proxy_source") or "direct").strip() or "direct"
+        egress_mode = str(attempt.get("egress_mode") or "direct").strip() or "direct"
+        clearance_mode = str(attempt.get("clearance_mode") or "none").strip() or "none"
+        clearance_enabled = bool(attempt.get("clearance_enabled"))
+        clearance_refresh_attempts = max(0, int(attempt.get("clearance_refresh_attempts") or 0))
+        clearance_refresh_success = max(0, int(attempt.get("clearance_refresh_success") or 0))
+        status_code = _extract_status_code(result.get("error"), result.get("status_code"))
+        cf_ray = _extract_cf_ray(result.get("error"))
+        error_text = _redact_register_log(result.get("error") or "registration_failed")[:300]
+        cloudflare_blocked = "cloudflare" in str(result.get("error") or "").lower()
+        stage_names = [
+            str(name).strip()
+            for name in (attempt.get("stage_order") if isinstance(attempt.get("stage_order"), list) else [])
+            if str(name).strip()
+        ]
+        stage_payloads = attempt.get("stages") if isinstance(attempt.get("stages"), dict) else {}
+
+        with self._lock:
+            stats = self._config["stats"]
+            diagnostics = stats.get("diagnostics") if isinstance(stats.get("diagnostics"), dict) else _default_register_diagnostics()
+            diagnostics["attempts"] = max(0, int(diagnostics.get("attempts") or 0)) + 1
+            outcome_key = "success" if result.get("ok") else "fail"
+            diagnostics[outcome_key] = max(0, int(diagnostics.get(outcome_key) or 0)) + 1
+
+            funnel = diagnostics.get("funnel") if isinstance(diagnostics.get("funnel"), dict) else {}
+            for stage_name in stage_names:
+                raw_stage = stage_payloads.get(stage_name) if isinstance(stage_payloads.get(stage_name), dict) else {}
+                stage_attempts = max(1, int(raw_stage.get("attempts") or 1))
+                stage_duration = max(0, int(raw_stage.get("duration_ms") or raw_stage.get("last_duration_ms") or 0))
+                stage_ok = bool(raw_stage.get("ok"))
+                entry = dict(funnel.get(stage_name) if isinstance(funnel.get(stage_name), dict) else {})
+                entry["reached"] = max(0, int(entry.get("reached") or 0)) + 1
+                entry["success" if stage_ok else "fail"] = max(0, int(entry.get("success" if stage_ok else "fail") or 0)) + 1
+                entry["retries"] = max(0, int(entry.get("retries") or 0)) + max(0, stage_attempts - 1)
+                entry["total_duration_ms"] = max(0, int(entry.get("total_duration_ms") or 0)) + stage_duration
+                reached = max(1, int(entry.get("reached") or 1))
+                entry["avg_duration_ms"] = round(int(entry["total_duration_ms"]) / reached, 1)
+                funnel[stage_name] = entry
+            diagnostics["funnel"] = funnel
+
+            providers = diagnostics.get("providers") if isinstance(diagnostics.get("providers"), dict) else {}
+            provider_entry = dict(providers.get(provider) if isinstance(providers.get(provider), dict) else {})
+            provider_entry[outcome_key] = max(0, int(provider_entry.get(outcome_key) or 0)) + 1
+            provider_entry["total_duration_ms"] = max(0, int(provider_entry.get("total_duration_ms") or 0)) + duration_ms
+            provider_total = max(1, int(provider_entry.get("success") or 0) + int(provider_entry.get("fail") or 0))
+            provider_entry["avg_duration_ms"] = round(int(provider_entry["total_duration_ms"]) / provider_total, 1)
+            provider_entry["last_at"] = _now()
+            provider_entry["last_flow"] = flow
+            if result.get("ok"):
+                provider_entry["last_error"] = ""
+            else:
+                provider_entry["last_error"] = error_text
+                failure_stages = dict(provider_entry.get("failure_stages") if isinstance(provider_entry.get("failure_stages"), dict) else {})
+                stage_key = failure_stage or "unknown"
+                failure_stages[stage_key] = max(0, int(failure_stages.get(stage_key) or 0)) + 1
+                provider_entry["failure_stages"] = failure_stages
+            providers[provider] = provider_entry
+            diagnostics["providers"] = providers
+
+            egresses = diagnostics.get("egresses") if isinstance(diagnostics.get("egresses"), dict) else {}
+            egress_entry = dict(egresses.get(proxy_label) if isinstance(egresses.get(proxy_label), dict) else {})
+            egress_entry[outcome_key] = max(0, int(egress_entry.get(outcome_key) or 0)) + 1
+            egress_entry["total_duration_ms"] = max(0, int(egress_entry.get("total_duration_ms") or 0)) + duration_ms
+            egress_total = max(1, int(egress_entry.get("success") or 0) + int(egress_entry.get("fail") or 0))
+            egress_entry["avg_duration_ms"] = round(int(egress_entry["total_duration_ms"]) / egress_total, 1)
+            egress_entry["last_at"] = _now()
+            egress_entry["last_flow"] = flow
+            egress_entry["proxy_source"] = proxy_source
+            egress_entry["egress_mode"] = egress_mode
+            egress_entry["clearance_mode"] = clearance_mode
+            egress_entry["clearance_enabled"] = clearance_enabled
+            egress_entry["clearance_refresh_attempts"] = max(0, int(egress_entry.get("clearance_refresh_attempts") or 0)) + clearance_refresh_attempts
+            egress_entry["clearance_refresh_success"] = max(0, int(egress_entry.get("clearance_refresh_success") or 0)) + clearance_refresh_success
+            if status_code:
+                status_codes = dict(egress_entry.get("status_codes") if isinstance(egress_entry.get("status_codes"), dict) else {})
+                status_key = str(status_code)
+                status_codes[status_key] = max(0, int(status_codes.get(status_key) or 0)) + 1
+                egress_entry["status_codes"] = status_codes
+                egress_entry["last_status_code"] = status_code
+            if cf_ray:
+                egress_entry["last_cf_ray"] = cf_ray
+            if cloudflare_blocked:
+                egress_entry["cloudflare_blocks"] = max(0, int(egress_entry.get("cloudflare_blocks") or 0)) + 1
+            if result.get("ok"):
+                egress_entry["last_error"] = ""
+            else:
+                egress_entry["last_error"] = error_text
+            egresses[proxy_label] = egress_entry
+            diagnostics["egresses"] = egresses
+
+            if failure_kind:
+                failure_kinds = diagnostics.get("failure_kinds") if isinstance(diagnostics.get("failure_kinds"), dict) else {}
+                failure_kinds[failure_kind] = max(0, int(failure_kinds.get(failure_kind) or 0)) + 1
+                diagnostics["failure_kinds"] = failure_kinds
+
+            if not result.get("ok"):
+                recent_failures = list(diagnostics.get("recent_failures") if isinstance(diagnostics.get("recent_failures"), list) else [])
+                recent_failures.append({
+                    "at": _now(),
+                    "provider": provider,
+                    "flow": flow,
+                    "stage": failure_stage or "unknown",
+                    "failure_kind": failure_kind or "registration_error",
+                    "error": error_text,
+                    "duration_ms": duration_ms,
+                    "proxy_label": proxy_label,
+                    "proxy_source": proxy_source,
+                    "clearance_mode": clearance_mode,
+                    "status_code": status_code,
+                    "cf_ray": cf_ray,
+                })
+                diagnostics["recent_failures"] = recent_failures[-20:]
+
+            stats["diagnostics"] = diagnostics
+
     def _notify(self, payload: dict) -> None:
         webhook_url = str(self._config.get("alert_webhook_url") or "").strip()
         if not webhook_url.startswith(("http://", "https://")):
@@ -621,6 +786,7 @@ class RegisterService:
         threading.Thread(target=send, daemon=True, name="register-alert").start()
 
     def _bump(self, **updates) -> None:
+        force_persist = bool(updates.pop("_persist", False))
         with self._lock:
             self._config["stats"].update(updates)
             stats = self._config["stats"]
@@ -637,7 +803,10 @@ class RegisterService:
                 stats["avg_seconds"] = round(elapsed / success, 1) if success else 0
                 stats["success_rate"] = round(success * 100 / max(1, success + fail), 1)
             self._config["stats"]["updated_at"] = _now()
-            self._save()
+            now = time.monotonic()
+            if force_persist or now - self._last_stats_persist_at >= 2.0:
+                self._save()
+                self._last_stats_persist_at = now
 
     @staticmethod
     def _safety_stop_reason(cfg: dict, submitted: int, consecutive_failures: int, started_at: float) -> str:
@@ -677,7 +846,7 @@ class RegisterService:
     def _schedule_next_check(self, seconds: float) -> None:
         delay = max(0.0, float(seconds))
         deadline = datetime.now(timezone.utc) + timedelta(seconds=delay)
-        self._bump(next_check_at=deadline.isoformat())
+        self._bump(_persist=True, next_check_at=deadline.isoformat())
 
     def _wait_for_next_check(self, seconds: float) -> None:
         self._wake_event.wait(timeout=max(0.1, float(seconds)))
@@ -857,6 +1026,7 @@ class RegisterService:
                     try:
                         result = future.result()
                         self._update_channel_health(result)
+                        self._record_attempt_diagnostics(result)
                         if result.get("ok"):
                             success += 1
                             batch_success = True

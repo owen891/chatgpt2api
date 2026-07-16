@@ -171,6 +171,23 @@ def _registration_failure_metadata(error: Exception) -> dict[str, object]:
     if parsed_retry_after is not None:
         result["retry_after"] = parsed_retry_after
     return result
+
+
+def _proxy_label(proxy_url: str) -> str:
+    raw = str(proxy_url or "").strip()
+    if not raw:
+        return "direct"
+    sample = raw if "://" in raw else f"http://{raw}"
+    try:
+        parsed = urlparse(sample)
+    except Exception:
+        return raw[:120]
+    host = parsed.hostname or parsed.netloc or raw
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    if parsed.scheme and host:
+        return f"{parsed.scheme}://{host}"
+    return raw[:120]
 stats = {"done": 0, "success": 0, "fail": 0, "start_time": 0.0}
 register_log_sink = None
 
@@ -832,17 +849,86 @@ class PlatformRegistrar:
         self.provider_name = "unknown"
         self.provider_ref = ""
         self.fingerprint = _make_browser_fingerprint()
+        profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True)
+        self.proxy_source = str(profile.proxy_source or "direct")
+        self.proxy_label = _proxy_label(profile.proxy_url or self.proxy)
+        self.egress_mode = str(profile.egress_mode or "direct")
+        self.clearance_mode = str(profile.clearance_mode or "none")
+        self.clearance_enabled = bool(profile.clearance_enabled)
         self.session = create_session(self.proxy, self.fingerprint)
         self.clearance_user_agent = ""
         self.clearance_failure_reason = ""
+        self.clearance_refresh_attempts = 0
+        self.clearance_refresh_success = 0
         self.device_id = str(uuid.uuid4())
         self.code_verifier = ""
         self.platform_auth_code = ""
         self.last_otp_continue_url = ""
         self.passwordless_signup = False
+        self.flow = "unknown"
+        self.failure_stage = ""
+        self.stage_order: list[str] = []
+        self.stage_timings: dict[str, dict[str, object]] = {}
 
     def close(self) -> None:
         self.session.close()
+
+    def _record_stage_result(self, stage: str, duration_ms: int, ok: bool) -> None:
+        key = str(stage or "").strip()
+        if not key:
+            return
+        current = self.stage_timings.get(key)
+        if not isinstance(current, dict):
+            current = {"attempts": 0, "duration_ms": 0, "last_duration_ms": 0, "ok": False}
+        attempts = max(0, int(current.get("attempts") or 0)) + 1
+        total_duration = max(0, int(current.get("duration_ms") or 0)) + max(0, int(duration_ms))
+        current.update({
+            "attempts": attempts,
+            "duration_ms": total_duration,
+            "last_duration_ms": max(0, int(duration_ms)),
+            "ok": bool(ok),
+        })
+        self.stage_timings[key] = current
+        if key not in self.stage_order:
+            self.stage_order.append(key)
+
+    def _run_stage(self, stage: str, func, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            result = func(*args, **kwargs)
+        except Exception:
+            self._record_stage_result(stage, int((time.perf_counter() - started) * 1000), False)
+            if not self.failure_stage:
+                self.failure_stage = str(stage or "").strip()
+            raise
+        self._record_stage_result(stage, int((time.perf_counter() - started) * 1000), True)
+        return result
+
+    def build_diagnostics(self, duration_ms: int = 0) -> dict[str, object]:
+        stages: dict[str, dict[str, object]] = {}
+        for name, payload in self.stage_timings.items():
+            if not isinstance(payload, dict):
+                continue
+            stages[str(name)] = {
+                "attempts": max(0, int(payload.get("attempts") or 0)),
+                "duration_ms": max(0, int(payload.get("duration_ms") or 0)),
+                "last_duration_ms": max(0, int(payload.get("last_duration_ms") or 0)),
+                "ok": bool(payload.get("ok")),
+            }
+        return {
+            "flow": str(self.flow or "unknown"),
+            "failure_stage": str(self.failure_stage or ""),
+            "duration_ms": max(0, int(duration_ms or 0)),
+            "proxy_label": self.proxy_label,
+            "proxy_source": self.proxy_source,
+            "egress_mode": self.egress_mode,
+            "clearance_mode": self.clearance_mode,
+            "clearance_enabled": self.clearance_enabled,
+            "clearance_refresh_attempts": max(0, int(self.clearance_refresh_attempts or 0)),
+            "clearance_refresh_success": max(0, int(self.clearance_refresh_success or 0)),
+            "stage_order": list(self.stage_order),
+            "stages": stages,
+        }
 
     def _navigate_headers(self, referer: str = "") -> dict[str, str]:
         headers = _header_fingerprint(navigate_headers, self.fingerprint)
@@ -858,6 +944,7 @@ class PlatformRegistrar:
         return headers
 
     def _refresh_cloudflare_clearance(self, target_url: str, index: int) -> ClearanceBundle | None:
+        self.clearance_refresh_attempts += 1
         self.clearance_failure_reason = ""
         profile = proxy_settings.get_profile(proxy=self.proxy, upstream=True)
         if not profile.clearance_enabled:
@@ -874,6 +961,7 @@ class PlatformRegistrar:
             upstream=True,
         )
         if bundle is not None:
+            self.clearance_refresh_success += 1
             _apply_clearance_to_session(self.session, bundle)
             self.clearance_user_agent = bundle.user_agent or self.clearance_user_agent
             if bundle.user_agent:
@@ -1258,9 +1346,19 @@ class PlatformRegistrar:
         step(index, "token 换取完成")
         return tokens
 
+    def _complete_signup_flow(self, mailbox: dict, first_name: str, last_name: str, index: int) -> dict:
+        step(index, "寮€濮嬬瓑寰呮敞鍐岄獙璇佺爜")
+        code = wait_for_code(mailbox, register_proxy=self.proxy)
+        if not code:
+            raise RuntimeError("绛夊緟娉ㄥ唽楠岃瘉鐮佽秴鏃?")
+        step(index, f"鏀跺埌娉ㄥ唽楠岃瘉鐮? {code}")
+        self._validate_otp(code, index)
+        self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
+        return self._exchange_registered_tokens(index)
+
     def register(self, index: int) -> dict:
         step(index, "开始创建邮箱")
-        mailbox = create_mailbox(register_proxy=self.proxy)
+        mailbox = self._run_stage("mailbox_create", create_mailbox, register_proxy=self.proxy)
         self.provider_name = str(mailbox.get("label") or mailbox.get("provider") or "unknown").strip() or "unknown"
         self.provider_ref = str(mailbox.get("provider_ref") or "").strip()
         email = str(mailbox.get("address") or "").strip()
@@ -1273,22 +1371,24 @@ class PlatformRegistrar:
             first_name, last_name = _random_name()
             # authorize 可能直接发送 OTP，先记录收信边界，避免慢跳转后漏掉验证码。
             mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-            landed = self._platform_authorize(email, index)
+            landed = self._run_stage("authorize", self._platform_authorize, email, index)
             if landed == "login":
-                tokens = self._passwordless_login(email, mailbox, index)
+                self.flow = "microsoft_passwordless_login"
+                tokens = self._run_stage("login_flow", self._passwordless_login, email, mailbox, index)
             else:
+                self.flow = "passwordless_signup"
                 if not self.passwordless_signup:
                     mailbox["_received_after"] = (datetime.now(timezone.utc) - timedelta(seconds=5)).isoformat()
-                    self._start_passwordless_signup(index)
+                    self._run_stage("signup_send_otp", self._start_passwordless_signup, index)
                 step(index, "已进入 passwordless signup，不创建本地不可用的随机密码")
                 step(index, "开始等待注册验证码")
-                code = wait_for_code(mailbox, register_proxy=self.proxy)
+                code = self._run_stage("signup_wait_otp", wait_for_code, mailbox, register_proxy=self.proxy)
                 if not code:
                     raise RuntimeError("等待注册验证码超时")
                 step(index, f"收到注册验证码: {code}")
-                self._validate_otp(code, index)
-                self._create_account(f"{first_name} {last_name}", _random_birthdate(), index)
-                tokens = self._exchange_registered_tokens(index)
+                self._run_stage("signup_validate_otp", self._validate_otp, code, index)
+                self._run_stage("signup_create_account", self._create_account, f"{first_name} {last_name}", _random_birthdate(), index)
+                tokens = self._run_stage("signup_exchange_tokens", self._exchange_registered_tokens, index)
         except Exception as error:
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
@@ -1307,15 +1407,16 @@ class PlatformRegistrar:
 
 
 def worker(index: int) -> dict:
-    start = time.time()
+    start = time.perf_counter()
     registrar = PlatformRegistrar(config["proxy"])
     try:
         step(index, "任务启动")
         result = registrar.register(index)
-        cost = time.time() - start
+        cost = time.perf_counter() - start
+        duration_ms = int(cost * 1000)
         access_token = str(result["access_token"])
-        account_service.add_account_items([result])
-        refresh_result = account_service.refresh_accounts([access_token])
+        registrar._run_stage("persist_account", account_service.add_account_items, [result])
+        refresh_result = registrar._run_stage("refresh_account", account_service.refresh_accounts, [access_token])
         if refresh_result.get("errors"):
             step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
         with stats_lock:
@@ -1323,9 +1424,16 @@ def worker(index: int) -> dict:
             stats["success"] += 1
             avg = (time.time() - stats["start_time"]) / stats["success"]
         log(f'{result["email"]} 注册成功，本次耗时{cost:.1f}s，全局平均每个号注册耗时{avg:.1f}s', "green")
-        return {"ok": True, "index": index, "result": result}
+        return {
+            "ok": True,
+            "index": index,
+            "result": result,
+            "duration_ms": duration_ms,
+            "diagnostics": registrar.build_diagnostics(duration_ms),
+        }
     except Exception as e:
-        cost = time.time() - start
+        cost = time.perf_counter() - start
+        duration_ms = int(cost * 1000)
         with stats_lock:
             stats["done"] += 1
             stats["fail"] += 1
@@ -1336,6 +1444,8 @@ def worker(index: int) -> dict:
             "error": str(e),
             "provider": registrar.provider_name,
             "provider_ref": registrar.provider_ref,
+            "duration_ms": duration_ms,
+            "diagnostics": registrar.build_diagnostics(duration_ms),
             **_registration_failure_metadata(e),
         }
     finally:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from services.account_service import ImageAccountSelectionError
 from services.protocol.conversation import ImageGenerationError
 from services.protocol.image_routing import run_json, run_stream
 
@@ -34,6 +35,22 @@ class ImagePoolRoutingTests(unittest.TestCase):
         )
 
         self.assertEqual(result["_image_route_selected"], "backup")
+        self.assertEqual(result["_image_pool_attempts"][0]["outcome"], "fallback")
+
+    def test_account_pool_auth_failure_falls_back_to_upstream(self) -> None:
+        body: dict = {}
+
+        result = run_json(
+            model="gpt-image-2",
+            body=body,
+            account_call=lambda: (_ for _ in ()).throw(
+                ImageAccountSelectionError("auth_invalid", "authentication failed for 1 accounts")
+            ),
+            upstream_call=lambda: {"data": [{"b64_json": "ok"}], "_image_upstream_selected": "backup"},
+        )
+
+        self.assertEqual(result["_image_route_selected"], "backup")
+        self.assertEqual(result["_image_pool_attempts"][0]["status"], 401)
         self.assertEqual(result["_image_pool_attempts"][0]["outcome"], "fallback")
 
     def test_content_policy_error_never_calls_upstream(self) -> None:
@@ -74,6 +91,21 @@ class ImagePoolRoutingTests(unittest.TestCase):
         def account_stream():
             yield {"progress_text": "account progress"}
             raise ImageGenerationError("timeout", status_code=504, code="upstream_timeout")
+
+        chunks = list(run_stream(
+            model="gpt-image-2",
+            body={},
+            account_call=account_stream,
+            upstream_call=lambda: {"data": [{"b64_json": "ok"}], "_image_upstream_selected": "backup"},
+        ))
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["_image_route_selected"], "backup")
+
+    def test_stream_account_pool_unavailable_falls_back_to_upstream(self) -> None:
+        def account_stream():
+            yield {"progress_text": "checking account pool"}
+            raise ImageAccountSelectionError("unavailable", "no account available")
 
         chunks = list(run_stream(
             model="gpt-image-2",

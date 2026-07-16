@@ -34,6 +34,25 @@ class ImageAccountSelectionError(RuntimeError):
         super().__init__(f"image_account_selection:{self.kind}; {message or self.kind}")
 
 
+class OAuthRefreshError(RuntimeError):
+    """Structured OAuth refresh failure so transient and terminal errors stay distinct."""
+
+    def __init__(self, status_code: int, error_code: str = "", description: str = "") -> None:
+        self.status_code = int(status_code or 0)
+        self.error_code = str(error_code or "").strip()
+        self.description = str(description or "").strip()[:300]
+        details = [f"oauth_refresh_http_{self.status_code}"]
+        if self.error_code:
+            details.append(self.error_code)
+        if self.description and self.description.casefold() != self.error_code.casefold():
+            details.append(self.description)
+        super().__init__(": ".join(details))
+
+
+class TerminalRefreshTokenError(OAuthRefreshError):
+    """The refresh credential is revoked or otherwise unusable."""
+
+
 class AccountService:
     """账号池服务，使用 token -> account 的 dict 保存账号。"""
 
@@ -44,6 +63,12 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    _TERMINAL_REFRESH_ERROR_CODES = frozenset({
+        "invalid_grant",
+        "invalid_refresh_token",
+        "refresh_token_invalidated",
+    })
+    _TERMINAL_REFRESH_MESSAGE_FRAGMENTS = ("session has ended",)
     _OAUTH_TOKEN_URL = "https://auth.openai.com/oauth/token"
     _OAUTH_CLIENT_ID = "app_2SKx67EdpoN0G6j64rFvigXD"
     _OAUTH_USER_AGENT = (
@@ -378,6 +403,40 @@ class AccountService:
             account = self._accounts.get(resolved)
             return resolved, dict(account) if account else None
 
+    @staticmethod
+    def _oauth_refresh_error_fields(data: object) -> tuple[str, str]:
+        if not isinstance(data, dict):
+            return "", ""
+        error = data.get("error")
+        nested = error if isinstance(error, dict) else {}
+        code = str(
+            nested.get("code")
+            or data.get("code")
+            or (error if isinstance(error, str) else "")
+            or ""
+        ).strip()
+        description = str(
+            data.get("error_description")
+            or nested.get("message")
+            or data.get("message")
+            or nested.get("description")
+            or ""
+        ).strip()
+        return code, description
+
+    @classmethod
+    def _is_terminal_refresh_error(cls, status_code: int, error_code: str, description: str) -> bool:
+        if status_code in {408, 429} or status_code >= 500:
+            return False
+        normalized_code = str(error_code or "").strip().casefold()
+        if normalized_code:
+            return normalized_code in cls._TERMINAL_REFRESH_ERROR_CODES
+        normalized_description = str(description or "").strip().casefold()
+        return status_code in {400, 401} and any(
+            fragment in normalized_description
+            for fragment in cls._TERMINAL_REFRESH_MESSAGE_FRAGMENTS
+        )
+
     def _record_token_refresh_error(self, access_token: str, event: str, error: str) -> None:
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -450,13 +509,17 @@ class AccountService:
                 },
                 timeout=60,
             )
-            data = response.json() if response.text else {}
-            if response.status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
-                detail = ""
-                if isinstance(data, dict):
-                    detail = str(data.get("error_description") or data.get("error") or data.get("message") or "")
-                detail = detail or self._safe_response_text(response)
-                raise RuntimeError(f"oauth_refresh_http_{response.status_code}{': ' + detail if detail else ''}")
+            raw_text = self._safe_response_text(response)
+            try:
+                data = response.json() if raw_text else {}
+            except Exception:
+                data = {}
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            if status_code != 200 or not isinstance(data, dict) or not data.get("access_token"):
+                error_code, description = self._oauth_refresh_error_fields(data)
+                description = description or raw_text
+                error_type = TerminalRefreshTokenError if self._is_terminal_refresh_error(status_code, error_code, description) else OAuthRefreshError
+                raise error_type(status_code, error_code, description)
             return {
                 "access_token": str(data.get("access_token") or "").strip(),
                 "refresh_token": str(data.get("refresh_token") or refresh_token).strip(),
@@ -529,6 +592,25 @@ class AccountService:
                 return active_token
             try:
                 token_data = self._request_access_token_refresh(refresh_token, account)
+            except TerminalRefreshTokenError as exc:
+                error_str = str(exc or "")
+                self._record_token_refresh_error(active_token, event, error_str)
+                self.remove_invalid_token(active_token, event)
+                return active_token
+            except OAuthRefreshError as exc:
+                error_str = str(exc or "")
+                self._record_token_refresh_error(active_token, event, error_str)
+                if "app_session_terminated" in error_str.lower():
+                    email = str(account.get("email") or "").strip()
+                    password = str(account.get("password") or "").strip()
+                    if email and password:
+                        t = Thread(
+                            target=self._password_re_login_thread,
+                            args=(active_token, email, password, event),
+                            daemon=True,
+                        )
+                        t.start()
+                return active_token
             except Exception as exc:
                 error_str = str(exc or "")
                 self._record_token_refresh_error(active_token, event, error_str)

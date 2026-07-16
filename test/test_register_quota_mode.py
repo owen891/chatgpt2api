@@ -6,9 +6,10 @@ import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from api.register import _consume_event_ticket, _issue_event_ticket
+from services.account_service import AccountService, TerminalRefreshTokenError
 from services.register.openai_register import _registration_failure_metadata, _retry_after_seconds
 from services.register_service import RegisterService, _redact_register_log
 
@@ -125,7 +126,7 @@ class RegisterQuotaModeTests(unittest.TestCase):
             self.assertFalse(service._target_reached(config, submitted=0))
             self.assertEqual(len(service._logs), 2)
 
-    def test_refill_starts_whenever_quota_is_below_target(self) -> None:
+    def test_refill_starts_below_quota_target_and_stops_at_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = RegisterService(Path(tmp_dir) / "register.json")
             service._config.update({"mode": "quota", "target_quota": 100, "trigger_quota": 50})
@@ -133,16 +134,22 @@ class RegisterQuotaModeTests(unittest.TestCase):
             service._pool_metrics = lambda **_kwargs: dict(metrics)
             self.assertTrue(service._refill_required(service.get()))
 
+            metrics.update(self._metrics(0))
+            self.assertTrue(service._refill_required(service.get()))
+
             metrics.update(self._metrics(100))
             self.assertFalse(service._refill_required(service.get()))
 
-    def test_refill_starts_whenever_available_accounts_are_below_target(self) -> None:
+    def test_refill_starts_below_available_target_and_stops_at_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = RegisterService(Path(tmp_dir) / "register.json")
             service._config.update({"mode": "available", "target_available": 4, "trigger_available": 1})
             metrics = self._metrics(75)
             service._pool_metrics = lambda **_kwargs: dict(metrics)
 
+            self.assertTrue(service._refill_required(service.get()))
+
+            metrics.update(self._metrics(0))
             self.assertTrue(service._refill_required(service.get()))
 
             metrics.update(self._metrics(100))
@@ -426,6 +433,101 @@ class RegisterQuotaModeTests(unittest.TestCase):
             self.assertFalse(runner.is_alive())
             self.assertFalse(service._config["enabled"])
 
+    def test_record_attempt_diagnostics_tracks_stage_funnel_and_recent_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            result = {
+                "ok": False,
+                "provider": "mail-a",
+                "error": "Cloudflare blocked: status=403, cf-ray=abc123-SIN, url=https://auth.openai.com/api/accounts/authorize?state=secret",
+                "failure_kind": "http_error",
+                "status_code": 403,
+                "duration_ms": 1200,
+                "diagnostics": {
+                    "flow": "passwordless_signup",
+                    "failure_stage": "signup_wait_otp",
+                    "duration_ms": 1200,
+                    "proxy_label": "http://proxy.example:8443",
+                    "proxy_source": "runtime",
+                    "egress_mode": "single_proxy",
+                    "clearance_mode": "flaresolverr",
+                    "clearance_enabled": True,
+                    "clearance_refresh_attempts": 1,
+                    "clearance_refresh_success": 0,
+                    "stage_order": ["mailbox_create", "authorize", "signup_send_otp", "signup_wait_otp"],
+                    "stages": {
+                        "mailbox_create": {"attempts": 1, "duration_ms": 100, "last_duration_ms": 100, "ok": True},
+                        "authorize": {"attempts": 1, "duration_ms": 200, "last_duration_ms": 200, "ok": True},
+                        "signup_send_otp": {"attempts": 1, "duration_ms": 150, "last_duration_ms": 150, "ok": True},
+                        "signup_wait_otp": {"attempts": 2, "duration_ms": 750, "last_duration_ms": 600, "ok": False},
+                    },
+                },
+            }
+
+            service._record_attempt_diagnostics(result)
+
+            diagnostics = service._config["stats"]["diagnostics"]
+            self.assertEqual(diagnostics["attempts"], 1)
+            self.assertEqual(diagnostics["fail"], 1)
+            self.assertEqual(diagnostics["funnel"]["signup_wait_otp"]["reached"], 1)
+            self.assertEqual(diagnostics["funnel"]["signup_wait_otp"]["fail"], 1)
+            self.assertEqual(diagnostics["funnel"]["signup_wait_otp"]["retries"], 1)
+            self.assertEqual(diagnostics["providers"]["mail-a"]["fail"], 1)
+            self.assertEqual(diagnostics["providers"]["mail-a"]["failure_stages"]["signup_wait_otp"], 1)
+            self.assertEqual(diagnostics["egresses"]["http://proxy.example:8443"]["fail"], 1)
+            self.assertEqual(diagnostics["egresses"]["http://proxy.example:8443"]["proxy_source"], "runtime")
+            self.assertEqual(diagnostics["egresses"]["http://proxy.example:8443"]["clearance_mode"], "flaresolverr")
+            self.assertEqual(diagnostics["egresses"]["http://proxy.example:8443"]["status_codes"]["403"], 1)
+            self.assertEqual(diagnostics["egresses"]["http://proxy.example:8443"]["last_cf_ray"], "abc123-SIN")
+            self.assertEqual(diagnostics["egresses"]["http://proxy.example:8443"]["cloudflare_blocks"], 1)
+            self.assertEqual(diagnostics["failure_kinds"]["http_error"], 1)
+            self.assertEqual(len(diagnostics["recent_failures"]), 1)
+            self.assertEqual(diagnostics["recent_failures"][0]["stage"], "signup_wait_otp")
+            self.assertEqual(diagnostics["recent_failures"][0]["proxy_label"], "http://proxy.example:8443")
+            self.assertEqual(diagnostics["recent_failures"][0]["status_code"], 403)
+            self.assertEqual(diagnostics["recent_failures"][0]["cf_ray"], "abc123-SIN")
+
+    def test_record_attempt_diagnostics_tracks_successful_provider_timing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            result = {
+                "ok": True,
+                "duration_ms": 900,
+                "result": {"register_provider": "mail-b"},
+                "diagnostics": {
+                    "flow": "microsoft_passwordless_login",
+                    "duration_ms": 900,
+                    "proxy_label": "direct",
+                    "proxy_source": "direct",
+                    "egress_mode": "direct",
+                    "clearance_mode": "none",
+                    "clearance_enabled": False,
+                    "clearance_refresh_attempts": 0,
+                    "clearance_refresh_success": 0,
+                    "stage_order": ["mailbox_create", "authorize", "login_flow", "persist_account", "refresh_account"],
+                    "stages": {
+                        "mailbox_create": {"attempts": 1, "duration_ms": 80, "last_duration_ms": 80, "ok": True},
+                        "authorize": {"attempts": 1, "duration_ms": 120, "last_duration_ms": 120, "ok": True},
+                        "login_flow": {"attempts": 1, "duration_ms": 500, "last_duration_ms": 500, "ok": True},
+                        "persist_account": {"attempts": 1, "duration_ms": 100, "last_duration_ms": 100, "ok": True},
+                        "refresh_account": {"attempts": 1, "duration_ms": 100, "last_duration_ms": 100, "ok": True},
+                    },
+                },
+            }
+
+            service._record_attempt_diagnostics(result)
+
+            diagnostics = service._config["stats"]["diagnostics"]
+            self.assertEqual(diagnostics["attempts"], 1)
+            self.assertEqual(diagnostics["success"], 1)
+            self.assertEqual(diagnostics["funnel"]["login_flow"]["success"], 1)
+            self.assertEqual(diagnostics["providers"]["mail-b"]["success"], 1)
+            self.assertEqual(diagnostics["providers"]["mail-b"]["avg_duration_ms"], 900.0)
+            self.assertEqual(diagnostics["providers"]["mail-b"]["last_flow"], "microsoft_passwordless_login")
+            self.assertEqual(diagnostics["egresses"]["direct"]["success"], 1)
+            self.assertEqual(diagnostics["egresses"]["direct"]["clearance_mode"], "none")
+            self.assertEqual(diagnostics["recent_failures"], [])
+
     def test_event_ticket_is_single_use(self) -> None:
         ticket = _issue_event_ticket()
         self.assertTrue(_consume_event_ticket(ticket))
@@ -443,6 +545,39 @@ class RegisterQuotaModeTests(unittest.TestCase):
     def test_register_log_redaction_preserves_url_trailing_punctuation(self) -> None:
         text = _redact_register_log("request failed (https://example.com/callback?code=secret), retrying")
         self.assertEqual(text, "request failed (https://example.com/callback?[query redacted]), retrying")
+
+    def test_oauth_refresh_error_classification_distinguishes_terminal_and_transient(self) -> None:
+        self.assertTrue(AccountService._is_terminal_refresh_error(400, "invalid_grant", ""))
+        self.assertTrue(AccountService._is_terminal_refresh_error(401, "", "Session has ended"))
+        self.assertFalse(AccountService._is_terminal_refresh_error(429, "invalid_grant", ""))
+        self.assertFalse(AccountService._is_terminal_refresh_error(503, "invalid_refresh_token", ""))
+
+    def test_oauth_refresh_error_fields_supports_nested_payloads(self) -> None:
+        self.assertEqual(
+            AccountService._oauth_refresh_error_fields({"error": {"code": "invalid_grant", "message": "expired"}}),
+            ("invalid_grant", "expired"),
+        )
+
+    def test_terminal_oauth_refresh_marks_account_invalid(self) -> None:
+        service = object.__new__(AccountService)
+        service._token_refresh_lock = threading.Lock()
+        service._get_account_for_token = lambda _token: ("access-token", {
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "email": "user@example.com",
+            "password": "",
+        })
+        service._token_needs_refresh = lambda _token, force=False: True
+        service._recent_token_refresh_error = lambda _account: False
+        service._request_access_token_refresh = Mock(
+            side_effect=TerminalRefreshTokenError(400, "invalid_grant", "expired")
+        )
+        service._record_token_refresh_error = Mock()
+        service.remove_invalid_token = Mock()
+
+        self.assertEqual(service.refresh_access_token("access-token"), "access-token")
+        service._record_token_refresh_error.assert_called_once()
+        service.remove_invalid_token.assert_called_once_with("access-token", "refresh_access_token")
 
 
 if __name__ == "__main__":

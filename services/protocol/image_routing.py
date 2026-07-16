@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from services.account_service import ImageAccountSelectionError
 from services.openai_backend_api import ImagePollTimeoutError
 from services.protocol.conversation import ImageGenerationError
 from utils.helper import is_supported_image_model
@@ -25,6 +26,11 @@ def uses_account_pool(model: object) -> bool:
 
 
 def allows_upstream_fallback(error: BaseException) -> bool:
+    # Pool selection errors describe the availability of our account pool, not
+    # a bad client request. Even auth_invalid (HTTP 401) should use a configured
+    # external upstream before the request is failed.
+    if isinstance(error, ImageAccountSelectionError):
+        return True
     if isinstance(error, ImagePollTimeoutError):
         return True
     if isinstance(error, ImageGenerationError):

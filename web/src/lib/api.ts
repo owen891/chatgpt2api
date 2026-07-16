@@ -754,6 +754,47 @@ export type RegisterConfig = {
     last_check_at?: string;
     next_check_at?: string;
     channel_health?: Record<string, { success?: number; fail?: number; last_error?: string; last_at?: string }>;
+    diagnostics?: {
+      attempts?: number;
+      success?: number;
+      fail?: number;
+      funnel?: Record<string, { reached?: number; success?: number; fail?: number; retries?: number; total_duration_ms?: number; avg_duration_ms?: number }>;
+      providers?: Record<string, { success?: number; fail?: number; total_duration_ms?: number; avg_duration_ms?: number; last_at?: string; last_flow?: string; last_error?: string; failure_stages?: Record<string, number> }>;
+      egresses?: Record<string, {
+        success?: number;
+        fail?: number;
+        total_duration_ms?: number;
+        avg_duration_ms?: number;
+        last_at?: string;
+        last_flow?: string;
+        last_error?: string;
+        proxy_source?: string;
+        egress_mode?: string;
+        clearance_mode?: string;
+        clearance_enabled?: boolean;
+        clearance_refresh_attempts?: number;
+        clearance_refresh_success?: number;
+        status_codes?: Record<string, number>;
+        last_status_code?: number;
+        last_cf_ray?: string;
+        cloudflare_blocks?: number;
+      }>;
+      failure_kinds?: Record<string, number>;
+      recent_failures?: Array<{
+        at?: string;
+        provider?: string;
+        flow?: string;
+        stage?: string;
+        failure_kind?: string;
+        error?: string;
+        duration_ms?: number;
+        proxy_label?: string;
+        proxy_source?: string;
+        clearance_mode?: string;
+        status_code?: number;
+        cf_ray?: string;
+      }>;
+    };
     phase?: "starting" | "monitoring" | "registering" | "cooldown" | "stopping" | "stopped";
     [key: string]: unknown;
   };
