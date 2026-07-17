@@ -1292,6 +1292,33 @@ class PlatformRegistrar:
         }
 
 
+def _store_and_validate_registered_account(result: dict, index: int) -> dict:
+    access_token = str(result.get("access_token") or "").strip()
+    if not access_token:
+        raise RuntimeError("registered_account_missing_access_token")
+
+    account_service.add_account_items([result])
+    refresh_result = account_service.refresh_accounts([access_token])
+    resolved_token = account_service.resolve_access_token(access_token)
+    account = account_service.get_account(resolved_token) or {}
+    remote_result = str(account.get("last_remote_check_result") or "").strip()
+    errors = list(refresh_result.get("errors") or [])
+
+    if remote_result == "auth_invalid":
+        account_service.delete_accounts([resolved_token])
+        raise RuntimeError("registered_account_auth_invalid")
+    if errors or remote_result != "success":
+        first_error = errors[0] if errors else None
+        detail = (
+            str(first_error.get("error") or "remote validation incomplete")
+            if isinstance(first_error, dict)
+            else str(first_error or "remote validation incomplete")
+        )
+        step(index, f"账号已保存，但远端验证失败: {detail}", "yellow")
+        raise RuntimeError(f"registered_account_validation_failed: {detail}")
+    return account
+
+
 def worker(index: int) -> dict:
     start = time.time()
     registrar = PlatformRegistrar(config["proxy"])
@@ -1299,11 +1326,7 @@ def worker(index: int) -> dict:
         step(index, "任务启动")
         result = registrar.register(index)
         cost = time.time() - start
-        access_token = str(result["access_token"])
-        account_service.add_account_items([result])
-        refresh_result = account_service.refresh_accounts([access_token])
-        if refresh_result.get("errors"):
-            step(index, f"账号已保存，刷新状态暂未成功，稍后可重试: {refresh_result['errors']}", "yellow")
+        _store_and_validate_registered_account(result, index)
         with stats_lock:
             stats["done"] += 1
             stats["success"] += 1
