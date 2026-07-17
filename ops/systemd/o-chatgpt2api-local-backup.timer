@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily local SQLite backup for o-chatgpt2api
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=o-chatgpt2api-local-backup.service
+
+[Install]
+WantedBy=timers.target

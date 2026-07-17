@@ -8,7 +8,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from threading import Condition, Lock, Thread
+from threading import BoundedSemaphore, Condition, Lock, Thread
 from typing import Any
 from urllib.parse import urlencode
 
@@ -63,6 +63,7 @@ class AccountService:
     _REFRESH_TOKEN_KEEPALIVE_ERROR_BACKOFF_SECONDS = 6 * 60 * 60
     _REFRESH_TOKEN_KEEPALIVE_BATCH_SIZE = 3
     _TOKEN_REFRESH_ERROR_BACKOFF_SECONDS = 5 * 60
+    _RELOGIN_MAX_CONCURRENCY = 2
     _TERMINAL_REFRESH_ERROR_CODES = frozenset({
         "invalid_grant",
         "invalid_refresh_token",
@@ -93,6 +94,8 @@ class AccountService:
         self._accounts = self._load_accounts()
         self._image_inflight: dict[str, int] = {}
         self._token_aliases: dict[str, str] = {}
+        self._relogin_active_tokens: set[str] = set()
+        self._relogin_semaphore = BoundedSemaphore(self._RELOGIN_MAX_CONCURRENCY)
         self._cumulative_total = self._load_cumulative_total()
 
     def _get_cumulative_file(self) -> Path:
@@ -604,12 +607,7 @@ class AccountService:
                     email = str(account.get("email") or "").strip()
                     password = str(account.get("password") or "").strip()
                     if email and password:
-                        t = Thread(
-                            target=self._password_re_login_thread,
-                            args=(active_token, email, password, event),
-                            daemon=True,
-                        )
-                        t.start()
+                        self._start_password_relogin(active_token, email, password, event)
                 return active_token
             except Exception as exc:
                 error_str = str(exc or "")
@@ -620,15 +618,68 @@ class AccountService:
                     email = str(account.get("email") or "").strip()
                     password = str(account.get("password") or "").strip()
                     if email and password:
-                        # 创建新线程执行密码重新登录
-                        t = Thread(
-                            target=self._password_re_login_thread,
-                            args=(active_token, email, password, event),
-                            daemon=True,
-                        )
-                        t.start()
+                        self._start_password_relogin(active_token, email, password, event)
                 return active_token
             return self._apply_refreshed_tokens(active_token, token_data, event)
+
+    def _run_password_relogin_jobs(
+        self,
+        jobs: list[tuple[str, str, str, str]],
+        progress_id: str | None = None,
+    ) -> None:
+        try:
+            with ThreadPoolExecutor(max_workers=min(self._RELOGIN_MAX_CONCURRENCY, len(jobs))) as executor:
+                futures = [
+                    executor.submit(
+                        self._execute_password_relogin_job,
+                        access_token,
+                        email,
+                        password,
+                        event,
+                        progress_id,
+                    )
+                    for access_token, email, password, event in jobs
+                ]
+                for future in futures:
+                    future.result()
+        finally:
+            with self._relogin_progress_lock:
+                self._relogin_active_tokens.difference_update(job[0] for job in jobs)
+
+    def _execute_password_relogin_job(
+        self,
+        access_token: str,
+        email: str,
+        password: str,
+        event: str,
+        progress_id: str | None = None,
+    ) -> None:
+        with self._relogin_semaphore:
+            self._password_re_login_thread(access_token, email, password, event, progress_id)
+
+    def _reserve_relogin_token(self, access_token: str) -> bool:
+        with self._relogin_progress_lock:
+            if access_token in self._relogin_active_tokens:
+                return False
+            self._relogin_active_tokens.add(access_token)
+            return True
+
+    def _start_password_relogin(
+        self,
+        access_token: str,
+        email: str,
+        password: str,
+        event: str,
+        progress_id: str | None = None,
+    ) -> bool:
+        if not self._reserve_relogin_token(access_token):
+            return False
+        Thread(
+            target=self._run_password_relogin_jobs,
+            args=([(access_token, email, password, event)], progress_id),
+            daemon=True,
+        ).start()
+        return True
 
     def _password_re_login_thread(self, access_token: str, email: str, password: str, event: str, progress_id: str | None = None) -> None:
         """密码重新登录线程入口"""
@@ -1725,7 +1776,7 @@ class AccountService:
             executor.shutdown(wait=True, cancel_futures=True)
 
         # 自动重新登录异常账号（仅当配置开启时）
-        relogined = 0
+        jobs: list[tuple[str, str, str, str]] = []
         if config.auto_relogin_after_refresh:
             for token in access_tokens:
                 account = self.get_account(token)
@@ -1738,13 +1789,16 @@ class AccountService:
                 password = str(account.get("password") or "").strip()
                 if not email or not password:
                     continue
-                t = Thread(
-                    target=self._password_re_login_thread,
-                    args=(token, email, password, "auto_relogin_after_refresh"),
-                    daemon=True,
-                )
-                t.start()
-                relogined += 1
+                if self._reserve_relogin_token(token):
+                    jobs.append((token, email, password, "auto_relogin_after_refresh"))
+
+        relogined = len(jobs)
+        if jobs:
+            Thread(
+                target=self._run_password_relogin_jobs,
+                args=(jobs, None),
+                daemon=True,
+            ).start()
 
         result = {
             "refreshed": refreshed,
@@ -1774,7 +1828,7 @@ class AccountService:
         if progress_id:
             self.init_relogin_progress(progress_id, len(access_tokens))
 
-        relogined = 0
+        jobs: list[tuple[str, str, str, str]] = []
         skipped = 0
         errors = []
 
@@ -1794,14 +1848,20 @@ class AccountService:
                     self.update_relogin_progress(progress_id, token, "跳过", "无邮箱密码")
                 continue
 
-            # 在新线程中执行密码重新登录
-            t = Thread(
-                target=self._password_re_login_thread,
-                args=(token, email, password, "manual_relogin", progress_id),
+            if not self._reserve_relogin_token(token):
+                skipped += 1
+                if progress_id:
+                    self.update_relogin_progress(progress_id, token, "跳过", "账号正在重登")
+                continue
+            jobs.append((token, email, password, "manual_relogin"))
+
+        relogined = len(jobs)
+        if jobs:
+            Thread(
+                target=self._run_password_relogin_jobs,
+                args=(jobs, progress_id),
                 daemon=True,
-            )
-            t.start()
-            relogined += 1
+            ).start()
 
         result = {
             "relogined": relogined,

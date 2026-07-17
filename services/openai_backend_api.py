@@ -308,7 +308,7 @@ class OpenAIBackendAPI:
             "event": "backend_user_info_account_payload",
             "plan_type": default_account.get("plan_type"),
             "account_user_role": default_account.get("account_user_role"),
-            "account_id": default_account.get("account_id"),
+            "account_id_present": bool(default_account.get("account_id")),
             "is_deactivated": default_account.get("is_deactivated"),
             "has_active_subscription": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("has_active_subscription"),
             "subscription_plan": (payload.get("accounts") or {}).get("default", {}).get("entitlement", {}).get("subscription_plan"),
@@ -352,8 +352,8 @@ class OpenAIBackendAPI:
         }
         logger.debug({
             "event": "backend_user_info_result",
-            "email": result.get("email"),
-            "user_id": result.get("user_id"),
+            "email_present": bool(result.get("email")),
+            "user_id_present": bool(result.get("user_id")),
             "type": result.get("type"),
             "quota": result.get("quota"),
             "image_quota_unknown": result.get("image_quota_unknown"),

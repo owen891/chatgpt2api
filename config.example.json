@@ -6,7 +6,6 @@
   "auto_remove_rate_limited_accounts": true,
   "auto_remove_invalid_accounts": false,
   "log_levels": [
-    "debug",
     "error",
     "info",
     "warning"
@@ -125,7 +124,7 @@
   "image_settle_enabled": true,
   "image_check_before_hit_enabled": true,
   "image_settle_secs": 2,
-  "auto_relogin_after_refresh": true,
+  "auto_relogin_after_refresh": false,
   "image_timeout_retry_secs": 30,
   "third_party_apps": {
     "infinite_canvas": {
