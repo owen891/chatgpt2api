@@ -1357,6 +1357,16 @@ def _generate_single_image(
             account_service.mark_image_result(token, False)
             if account_email:
                 setattr(exc, "account_email", account_email)
+            conversation_id = str(getattr(exc, "conversation_id", "") or "").strip()
+            if conversation_id:
+                logger.warning({
+                    "event": "image_poll_timeout_preserved",
+                    "request_token": token,
+                    "account_email": account_email,
+                    "conversation_id": conversation_id,
+                    "index": index,
+                })
+                raise
             # 轮询超时：换账号重试
             if not emitted_for_token:
                 poll_timeout_retry_count += 1

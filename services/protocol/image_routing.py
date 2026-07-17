@@ -32,7 +32,9 @@ def allows_upstream_fallback(error: BaseException) -> bool:
     if isinstance(error, ImageAccountSelectionError):
         return True
     if isinstance(error, ImagePollTimeoutError):
-        return True
+        # The upstream accepted this request. Keep the conversation available
+        # for resume-poll instead of starting a duplicate generation elsewhere.
+        return not bool(str(getattr(error, "conversation_id", "") or "").strip())
     if isinstance(error, ImageGenerationError):
         code = str(getattr(error, "code", "") or "").strip().lower()
         status = int(getattr(error, "status_code", 0) or 0)

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from services.account_service import ImageAccountSelectionError
-from services.protocol.conversation import ImageGenerationError
+from services.openai_backend_api import ImagePollTimeoutError
+from services.protocol.conversation import ConversationRequest, ImageGenerationError, _generate_single_image
 from services.protocol.image_routing import run_json, run_stream
 
 
@@ -36,6 +38,52 @@ class ImagePoolRoutingTests(unittest.TestCase):
 
         self.assertEqual(result["_image_route_selected"], "backup")
         self.assertEqual(result["_image_pool_attempts"][0]["outcome"], "fallback")
+
+    def test_accepted_poll_timeout_does_not_fall_back_to_upstream(self) -> None:
+        timeout = ImagePollTimeoutError("ChatGPT 生图超时")
+        timeout.conversation_id = "conv-pending"
+        upstream = mock.Mock(return_value={"data": [{"b64_json": "duplicate"}]})
+
+        with self.assertRaises(ImagePollTimeoutError) as raised:
+            run_json(
+                model="gpt-image-2",
+                body={},
+                account_call=mock.Mock(side_effect=timeout),
+                upstream_call=upstream,
+            )
+
+        self.assertIs(raised.exception, timeout)
+        upstream.assert_not_called()
+
+    def test_accepted_poll_timeout_does_not_select_another_account(self) -> None:
+        timeout = ImagePollTimeoutError("ChatGPT 生图超时")
+        timeout.conversation_id = "conv-pending"
+        backend = mock.Mock()
+
+        with (
+            mock.patch(
+                "services.protocol.conversation.account_service.get_available_access_token",
+                return_value="token-1",
+            ) as select_account,
+            mock.patch(
+                "services.protocol.conversation.account_service.get_account",
+                return_value={"email": "account@example.test"},
+            ),
+            mock.patch("services.protocol.conversation.account_service.mark_image_result"),
+            mock.patch("services.protocol.conversation.OpenAIBackendAPI", return_value=backend),
+            mock.patch("services.protocol.conversation.stream_image_outputs", side_effect=timeout),
+        ):
+            with self.assertRaises(ImagePollTimeoutError) as raised:
+                _generate_single_image(
+                    ConversationRequest(prompt="draw", model="gpt-image-2"),
+                    1,
+                    1,
+                )
+
+        self.assertIs(raised.exception, timeout)
+        self.assertEqual(raised.exception.conversation_id, "conv-pending")
+        select_account.assert_called_once()
+        backend.close.assert_called_once()
 
     def test_account_pool_auth_failure_falls_back_to_upstream(self) -> None:
         body: dict = {}
