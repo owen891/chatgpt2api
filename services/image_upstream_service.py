@@ -409,7 +409,9 @@ class ImageUpstreamService:
         url = f"{channel['base_url']}/images/{'generations' if operation == 'generation' else 'edits'}"
         kwargs: dict[str, Any] = {
             "headers": self._headers(channel),
-            "timeout": float(channel.get("timeout_secs") or 90),
+            # Image upstreams can perform their own polling and account retry.
+            # Keep the default above that full lifecycle, not just first-byte time.
+            "timeout": float(channel.get("timeout_secs") or 360),
             "proxies": self._proxies(channel),
         }
         if operation == "generation":

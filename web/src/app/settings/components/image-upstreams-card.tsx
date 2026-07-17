@@ -15,7 +15,7 @@ import { useSettingsStore } from "../store";
 function createChannel(): ImageUpstreamChannel {
   return {
     id: crypto.randomUUID(), name: "新生图上游", model_alias: "", enabled: true, priority: 10, default: false,
-    base_url: "", api_key: "", has_api_key: false, clear_api_key: false, timeout_secs: 90, proxy_url: "",
+    base_url: "", api_key: "", has_api_key: false, clear_api_key: false, timeout_secs: 360, proxy_url: "",
     supports_generation: true, supports_edits: true, failure_threshold: 3, cooldown_secs: 120, max_concurrency: 3, requests_per_minute: 60,
     model_mappings: [{ client_model: "gpt-image-2", upstream_model: "gpt-image-1" }],
   };

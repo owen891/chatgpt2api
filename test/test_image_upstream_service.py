@@ -118,6 +118,18 @@ class ImageUpstreamServiceTests(unittest.TestCase):
         self.assertEqual(file_names, ["image", "mask"])
         self.assertEqual(calls[0]["data"]["model"], "first-model")
 
+    def test_image_request_uses_long_running_default_timeout(self) -> None:
+        first = channel("first", 10)
+        first.pop("timeout_secs")
+        service, _storage, calls = self.make_service_with_channels(
+            [first],
+            [response(200, {"data": [{"b64_json": base64.b64encode(PNG_BYTES).decode()}]})],
+        )
+
+        service.try_handle("generation", {"model": "gpt-image-2", "prompt": "test"})
+
+        self.assertEqual(calls[0]["timeout"], 360.0)
+
     def test_archive_failure_is_terminal_and_does_not_retry_generation(self) -> None:
         service, _storage, calls = self.make_service([
             response(200, {"data": [{"b64_json": "not-valid-base64"}]}),

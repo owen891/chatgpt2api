@@ -147,7 +147,7 @@
         "default": false,
         "base_url": "https://example.com/v1",
         "api_key": "",
-        "timeout_secs": 120,
+        "timeout_secs": 360,
         "proxy_url": "",
         "supports_generation": true,
         "supports_edits": true,

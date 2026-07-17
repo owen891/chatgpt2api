@@ -418,7 +418,7 @@ def _normalize_image_upstreams(value: object) -> dict[str, object]:
             "default": is_default,
             "base_url": str(item.get("base_url") or "").strip().rstrip("/"),
             "api_key": str(item.get("api_key") or "").strip(),
-            "timeout_secs": min(600, _normalize_positive_int(item.get("timeout_secs"), 90, 1)),
+            "timeout_secs": min(600, _normalize_positive_int(item.get("timeout_secs"), 360, 1)),
             "proxy_url": str(item.get("proxy_url") or "").strip(),
             "supports_generation": _normalize_bool(item.get("supports_generation"), True),
             "supports_edits": _normalize_bool(item.get("supports_edits"), True),

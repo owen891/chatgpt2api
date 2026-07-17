@@ -33,6 +33,7 @@ class ImageUpstreamConfigTests(unittest.TestCase):
             channel = public["channels"][0]
             self.assertNotIn("api_key", channel)
             self.assertTrue(channel["has_api_key"])
+            self.assertEqual(channel["timeout_secs"], 360)
             self.assertNotIn("secret", json.dumps(public))
 
             saved = store.update({"image_upstreams": public})
