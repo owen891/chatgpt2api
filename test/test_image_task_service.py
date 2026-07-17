@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from services.image_task_service import ImageTaskService
+from services.openai_backend_api import ImagePollTimeoutError
 
 
 OWNER = {"id": "owner-1", "name": "Owner", "role": "admin"}
@@ -108,6 +109,40 @@ class ImageTaskServiceTests(unittest.TestCase):
             self.assertEqual(result["missing_ids"], [])
             self.assertEqual(result["items"][0]["status"], "success")
             self.assertEqual(result["items"][0]["data"][0]["url"], "http://example.test/image.png")
+
+    def test_poll_timeout_can_resume_with_original_account(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            timeout = ImagePollTimeoutError("ChatGPT 生图超时（已等待 120 秒）。")
+            timeout.conversation_id = "conv-pending"
+            timeout.access_token = "token-original"
+
+            def handler(_payload):
+                raise timeout
+
+            service = self.make_service(Path(tmp_dir) / "image_tasks.json", handler)
+            service.submit_generation(
+                OWNER,
+                client_task_id="timeout-task",
+                prompt="cat",
+                model="gpt-image-2",
+                size=None,
+                base_url="http://local.test",
+            )
+            failed = wait_for_task(service, OWNER, "timeout-task", "error")
+            self.assertEqual(failed["conversation_id"], "conv-pending")
+            self.assertNotIn("_resume_access_token", failed)
+
+            backend = mock.Mock()
+            backend._poll_image_results.return_value = (["file-one"], [])
+            backend.resolve_conversation_image_urls.return_value = ["https://example.test/image.png"]
+            backend.download_image_bytes.return_value = [b"image-bytes"]
+            with mock.patch("services.openai_backend_api.OpenAIBackendAPI", return_value=backend) as backend_class:
+                service.resume_poll(OWNER, "timeout-task", 30)
+                resumed = wait_for_task(service, OWNER, "timeout-task", "success")
+
+            backend_class.assert_called_once_with(access_token="token-original")
+            backend._poll_image_results.assert_called_once_with("conv-pending", 30)
+            self.assertTrue(resumed["data"][0]["b64_json"])
 
     def test_success_task_can_expose_upstream_url_when_archive_is_pending(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

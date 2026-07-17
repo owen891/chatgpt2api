@@ -1359,6 +1359,7 @@ def _generate_single_image(
                 setattr(exc, "account_email", account_email)
             conversation_id = str(getattr(exc, "conversation_id", "") or "").strip()
             if conversation_id:
+                setattr(exc, "access_token", token)
                 logger.warning({
                     "event": "image_poll_timeout_preserved",
                     "request_token": token,

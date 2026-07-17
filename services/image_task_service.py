@@ -380,12 +380,14 @@ class ImageTaskService:
             error_message = str(exc) or "image task failed"
             account_email = _clean(getattr(exc, "account_email", ""))
             conversation_id = _clean(getattr(exc, "conversation_id", ""))
+            resume_access_token = _clean(getattr(exc, "access_token", ""))
             pending_archive = _normalize_pending_archive(getattr(exc, "image_pending_archive", None))
             duration_ms = int((time.time() - started) * 1000)
             if not self._update_task(key, status=TASK_STATUS_ERROR, error=error_message, data=[],
                                      duration_ms=duration_ms,
                                      pending_archive=pending_archive,
-                                     **({"conversation_id": conversation_id} if conversation_id else {})):
+                                     **({"conversation_id": conversation_id} if conversation_id else {}),
+                                     **({"_resume_access_token": resume_access_token} if resume_access_token else {})):
                 return
             self._log_call(
                 identity,
@@ -661,6 +663,7 @@ class ImageTaskService:
             conversation_id = _clean(task.get("conversation_id"))
             if not conversation_id:
                 raise ValueError("task has no conversation_id")
+            resume_access_token = _clean(task.get("_resume_access_token"))
             mode = task.get("mode", "generate")
             model = task.get("model", "gpt-image-2")
             # 将任务状态重置为 running
@@ -669,7 +672,7 @@ class ImageTaskService:
         # 启动新线程继续轮询
         thread = threading.Thread(
             target=self._run_resume_poll,
-            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model),
+            args=(key, conversation_id, extra_timeout_secs, dict(identity), mode, model, resume_access_token),
             name=f"image-resume-{_clean(task_id)[:16]}",
             daemon=True,
         )
@@ -684,6 +687,7 @@ class ImageTaskService:
         identity: dict[str, object],
         mode: str,
         model: str,
+        access_token: str,
     ) -> None:
         """后台线程：继续轮询已有 conversation_id 的图片结果。"""
         started = time.time()
@@ -694,7 +698,7 @@ class ImageTaskService:
             from services.openai_backend_api import OpenAIBackendAPI
             from services.protocol.conversation import format_image_result
 
-            backend = OpenAIBackendAPI(proxy_url=config.proxy_url or None)
+            backend = OpenAIBackendAPI(access_token=access_token)
             file_ids, sediment_ids = backend._poll_image_results(
                 conversation_id,
                 extra_timeout_secs,
