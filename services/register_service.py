@@ -5,7 +5,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from services.account_service import account_service
@@ -73,7 +73,7 @@ def _ensure_provider_id(provider: dict) -> str:
 
 
 def _default_config() -> dict:
-    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0}}
+    return {**openai_register.config, "mode": "total", "target_quota": 100, "target_available": 10, "check_interval": 5, "rate_limit_cooldown_seconds": 900, "enabled": False, "stats": {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": openai_register.config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "current_quota": 0, "current_available": 0, "phase": "stopped", "stop_reason": "", "next_check_at": ""}}
 
 
 def _normalize(raw: dict) -> dict:
@@ -85,6 +85,7 @@ def _normalize(raw: dict) -> dict:
     cfg["target_quota"] = max(1, int(cfg.get("target_quota") or 1))
     cfg["target_available"] = max(1, int(cfg.get("target_available") or 1))
     cfg["check_interval"] = max(1, int(cfg.get("check_interval") or 5))
+    cfg["rate_limit_cooldown_seconds"] = max(60, int(cfg.get("rate_limit_cooldown_seconds") or 900))
     cfg["proxy"] = str(cfg.get("proxy") or "").strip()
     default_mail = _default_config()["mail"] if isinstance(_default_config().get("mail"), dict) else {}
     mail = cfg.get("mail") if isinstance(cfg.get("mail"), dict) else {}
@@ -263,7 +264,7 @@ class RegisterService:
             self._drop_mail_proxy()
             self._logs = []
             metrics = self._pool_metrics()
-            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "started_at": _now(), "updated_at": _now()}
+            self._config["stats"] = {"job_id": uuid.uuid4().hex, "success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], **metrics, "phase": "registering", "stop_reason": "", "next_check_at": "", "started_at": _now(), "updated_at": _now()}
             openai_register.config.update({k: self._config[k] for k in ("mail", "proxy", "total", "threads")})
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": time.time()})
@@ -276,6 +277,8 @@ class RegisterService:
     def stop(self) -> dict:
         with self._lock:
             self._config["enabled"] = False
+            self._config["stats"]["phase"] = "stopping"
+            self._config["stats"]["next_check_at"] = ""
             self._config["stats"]["updated_at"] = _now()
             self._save()
             self._append_log("已请求停止注册任务，正在等待当前运行任务结束", "yellow")
@@ -284,7 +287,7 @@ class RegisterService:
     def reset(self) -> dict:
         with self._lock:
             self._logs = []
-            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, **self._pool_metrics(), "updated_at": _now()}
+            self._config["stats"] = {"success": 0, "fail": 0, "done": 0, "running": 0, "threads": self._config["threads"], "elapsed_seconds": 0, "avg_seconds": 0, "success_rate": 0, "phase": "stopped", "stop_reason": "", "next_check_at": "", **self._pool_metrics(), "updated_at": _now()}
             with openai_register.stats_lock:
                 openai_register.stats.update({"done": 0, "success": 0, "fail": 0, "start_time": 0.0})
             self._save()
@@ -385,11 +388,37 @@ class RegisterService:
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
+        rate_limit_pending = False
+        rate_limit_retry_after = 0
+        cooldown_until = 0.0
         with ThreadPoolExecutor(max_workers=threads) as executor:
             futures = set()
             while True:
                 cfg = self.get()
-                while self.get()["enabled"] and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                enabled = bool(cfg.get("enabled"))
+                if rate_limit_pending and not futures:
+                    if not enabled or self._target_reached(cfg, submitted):
+                        rate_limit_pending = False
+                        cooldown_until = 0.0
+                    else:
+                        if cooldown_until <= 0:
+                            cooldown_seconds = max(int(cfg.get("rate_limit_cooldown_seconds") or 900), rate_limit_retry_after)
+                            cooldown_until = time.monotonic() + cooldown_seconds
+                            next_check_at = (datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)).isoformat()
+                            reason = f"注册出口触发上游限流（HTTP 429），暂停领取新任务，{cooldown_seconds} 秒后自动重试"
+                            self._bump(phase="cooldown", stop_reason=reason, next_check_at=next_check_at)
+                            self._append_log(reason, "yellow")
+                        remaining = cooldown_until - time.monotonic()
+                        if remaining > 0:
+                            time.sleep(min(1.0, remaining))
+                            continue
+                        rate_limit_pending = False
+                        rate_limit_retry_after = 0
+                        cooldown_until = 0.0
+                        self._bump(phase="registering", stop_reason="", next_check_at="")
+                        self._append_log("限流冷却结束，恢复注册任务", "yellow")
+                        cfg = self.get()
+                while self.get()["enabled"] and not rate_limit_pending and not self._target_reached(cfg, submitted) and len(futures) < threads:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
@@ -405,9 +434,12 @@ class RegisterService:
                         result = future.result()
                         success += 1 if result.get("ok") else 0
                         fail += 0 if result.get("ok") else 1
+                        if not result.get("ok") and str(result.get("failure_kind") or "") == "rate_limit":
+                            rate_limit_pending = True
+                            rate_limit_retry_after = max(rate_limit_retry_after, int(result.get("retry_after") or 0))
                     except Exception:
                         fail += 1
-        self._bump(running=0, done=done, success=success, fail=fail, finished_at=_now())
+        self._bump(running=0, done=done, success=success, fail=fail, phase="stopped", next_check_at="", finished_at=_now())
         with self._lock:
             self._config["enabled"] = False
             self._save()

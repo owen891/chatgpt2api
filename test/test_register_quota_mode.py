@@ -114,6 +114,34 @@ class RegisterServiceSourceCompatTests(unittest.TestCase):
             self.assertEqual(service._config["stats"]["success"], 1)
             self.assertEqual(service._config["stats"]["done"], 1)
 
+    def test_rate_limit_pauses_before_submitting_next_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config.update({
+                "enabled": True,
+                "mode": "total",
+                "total": 2,
+                "threads": 1,
+                "rate_limit_cooldown_seconds": 1,
+            })
+            call_times: list[float] = []
+
+            def worker(_index: int) -> dict:
+                call_times.append(time.monotonic())
+                if len(call_times) == 1:
+                    return {"ok": False, "failure_kind": "rate_limit", "status_code": 429}
+                return {"ok": True}
+
+            with patch("services.register_service.openai_register.worker", side_effect=worker):
+                service._run()
+
+            self.assertEqual(len(call_times), 2)
+            self.assertGreaterEqual(call_times[1] - call_times[0], 0.9)
+            self.assertEqual(service._config["stats"]["success"], 1)
+            self.assertEqual(service._config["stats"]["fail"], 1)
+            self.assertTrue(any("限流" in item["text"] for item in service._logs))
+
     def test_quota_mode_stops_submitting_once_target_is_reached(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = RegisterService(Path(tmp_dir) / "register.json")
