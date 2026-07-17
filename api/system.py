@@ -244,10 +244,12 @@ def create_router(app_version: str) -> APIRouter:
         return list_images(resolve_image_base_url(request), start_date=start_date.strip(), end_date=end_date.strip())
 
     @router.get("/images/{image_path:path}", include_in_schema=False)
+    @router.head("/images/{image_path:path}", include_in_schema=False)
     async def get_image(image_path: str):
         return get_image_response(image_path)
 
     @router.get("/image-thumbnails/{image_path:path}", include_in_schema=False)
+    @router.head("/image-thumbnails/{image_path:path}", include_in_schema=False)
     async def get_image_thumbnail(image_path: str):
         return get_thumbnail_response(image_path)
 
