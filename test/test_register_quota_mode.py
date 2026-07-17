@@ -142,6 +142,113 @@ class RegisterServiceSourceCompatTests(unittest.TestCase):
             self.assertEqual(service._config["stats"]["fail"], 1)
             self.assertTrue(any("限流" in item["text"] for item in service._logs))
 
+    def test_first_worker_probes_egress_before_full_concurrency(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config.update({
+                "enabled": True,
+                "mode": "total",
+                "total": 3,
+                "threads": 3,
+            })
+            first_started = threading.Event()
+            release_first = threading.Event()
+            call_count = 0
+            call_lock = threading.Lock()
+
+            def worker(_index: int) -> dict:
+                nonlocal call_count
+                with call_lock:
+                    call_count += 1
+                    current_call = call_count
+                if current_call == 1:
+                    first_started.set()
+                    release_first.wait(timeout=2)
+                return {"ok": True}
+
+            with patch("services.register_service.openai_register.worker", side_effect=worker):
+                runner = threading.Thread(target=service._run, daemon=True)
+                runner.start()
+                self.assertTrue(first_started.wait(timeout=1))
+                time.sleep(0.1)
+                self.assertEqual(call_count, 1)
+                release_first.set()
+                runner.join(timeout=2)
+
+            self.assertFalse(runner.is_alive())
+            self.assertEqual(call_count, 3)
+            self.assertEqual(service._config["stats"]["success"], 3)
+
+    def test_rate_limit_recovery_uses_one_worker_until_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config.update({
+                "enabled": True,
+                "mode": "total",
+                "total": 4,
+                "threads": 3,
+                "rate_limit_cooldown_seconds": 1,
+            })
+            recovery_started = threading.Event()
+            release_recovery = threading.Event()
+            call_count = 0
+            call_lock = threading.Lock()
+
+            def worker(_index: int) -> dict:
+                nonlocal call_count
+                with call_lock:
+                    call_count += 1
+                    current_call = call_count
+                if current_call == 1:
+                    return {"ok": False, "failure_kind": "rate_limit", "status_code": 429}
+                if current_call == 2:
+                    recovery_started.set()
+                    release_recovery.wait(timeout=2)
+                return {"ok": True}
+
+            with patch("services.register_service.openai_register.worker", side_effect=worker):
+                runner = threading.Thread(target=service._run, daemon=True)
+                runner.start()
+                self.assertTrue(recovery_started.wait(timeout=2))
+                time.sleep(0.1)
+                self.assertEqual(call_count, 2)
+                release_recovery.set()
+                runner.join(timeout=2)
+
+            self.assertFalse(runner.is_alive())
+            self.assertEqual(call_count, 4)
+            self.assertEqual(service._config["stats"]["success"], 3)
+            self.assertEqual(service._config["stats"]["fail"], 1)
+
+    def test_manual_stop_replaces_stale_rate_limit_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            service = RegisterService(Path(tmp_dir) / "register.json")
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config.update({
+                "enabled": True,
+                "mode": "quota",
+                "target_quota": 100,
+                "threads": 1,
+                "rate_limit_cooldown_seconds": 60,
+            })
+
+            with patch(
+                "services.register_service.openai_register.worker",
+                return_value={"ok": False, "failure_kind": "rate_limit", "status_code": 429},
+            ):
+                runner = threading.Thread(target=service._run, daemon=True)
+                service._runner = runner
+                runner.start()
+                self._wait_for(lambda: service._config["stats"].get("phase") == "cooldown")
+                service.stop()
+                runner.join(timeout=2)
+
+            self.assertFalse(runner.is_alive())
+            self.assertEqual(service._config["stats"]["phase"], "stopped")
+            self.assertEqual(service._config["stats"]["stop_reason"], "用户手动停止")
+
     def test_quota_mode_stops_submitting_once_target_is_reached(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = RegisterService(Path(tmp_dir) / "register.json")

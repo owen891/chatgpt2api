@@ -272,12 +272,15 @@ class RegisterService:
             self._runner = threading.Thread(target=self._run, daemon=True, name="openai-register")
             self._runner.start()
             self._append_log(f"注册任务启动，模式={self._config['mode']}，线程数={self._config['threads']}", "yellow")
+            if self._config["threads"] > 1:
+                self._append_log("出口探测模式：先使用 1 个线程，成功后恢复配置并发", "yellow")
             return self.get()
 
     def stop(self) -> dict:
         with self._lock:
             self._config["enabled"] = False
             self._config["stats"]["phase"] = "stopping"
+            self._config["stats"]["stop_reason"] = "用户手动停止"
             self._config["stats"]["next_check_at"] = ""
             self._config["stats"]["updated_at"] = _now()
             self._save()
@@ -388,6 +391,8 @@ class RegisterService:
     def _run(self) -> None:
         threads = int(self.get()["threads"])
         submitted, done, success, fail = 0, 0, 0, 0
+        probe_pending = True
+        rate_limit_recovery = False
         rate_limit_pending = False
         rate_limit_retry_after = 0
         cooldown_until = 0.0
@@ -397,11 +402,14 @@ class RegisterService:
                 cfg = self.get()
                 enabled = bool(cfg.get("enabled"))
                 if rate_limit_pending and not futures:
-                    if not enabled or self._target_reached(cfg, submitted):
+                    if not enabled:
                         rate_limit_pending = False
                         cooldown_until = 0.0
                     else:
                         if cooldown_until <= 0:
+                            if self._target_reached(cfg, submitted):
+                                rate_limit_pending = False
+                                continue
                             cooldown_seconds = max(int(cfg.get("rate_limit_cooldown_seconds") or 900), rate_limit_retry_after)
                             cooldown_until = time.monotonic() + cooldown_seconds
                             next_check_at = (datetime.now(timezone.utc) + timedelta(seconds=cooldown_seconds)).isoformat()
@@ -415,10 +423,12 @@ class RegisterService:
                         rate_limit_pending = False
                         rate_limit_retry_after = 0
                         cooldown_until = 0.0
+                        rate_limit_recovery = True
                         self._bump(phase="registering", stop_reason="", next_check_at="")
                         self._append_log("限流冷却结束，恢复注册任务", "yellow")
                         cfg = self.get()
-                while self.get()["enabled"] and not rate_limit_pending and not self._target_reached(cfg, submitted) and len(futures) < threads:
+                concurrency_limit = 1 if probe_pending or rate_limit_recovery else threads
+                while self.get()["enabled"] and not rate_limit_pending and not self._target_reached(cfg, submitted) and len(futures) < concurrency_limit:
                     submitted += 1
                     futures.add(executor.submit(openai_register.worker, submitted))
                 self._bump(running=len(futures), done=done, success=success, fail=fail)
@@ -434,11 +444,20 @@ class RegisterService:
                         result = future.result()
                         success += 1 if result.get("ok") else 0
                         fail += 0 if result.get("ok") else 1
-                        if not result.get("ok") and str(result.get("failure_kind") or "") == "rate_limit":
+                        if result.get("ok"):
+                            probe_pending = False
+                            if rate_limit_recovery:
+                                rate_limit_recovery = False
+                                self._append_log("429 恢复探测成功，恢复配置并发", "green")
+                        elif str(result.get("failure_kind") or "") == "rate_limit":
+                            rate_limit_recovery = True
                             rate_limit_pending = True
                             rate_limit_retry_after = max(rate_limit_retry_after, int(result.get("retry_after") or 0))
+                        else:
+                            probe_pending = False
                     except Exception:
                         fail += 1
+                        probe_pending = False
         self._bump(running=0, done=done, success=success, fail=fail, phase="stopped", next_check_at="", finished_at=_now())
         with self._lock:
             self._config["enabled"] = False

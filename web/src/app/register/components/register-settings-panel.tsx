@@ -82,7 +82,7 @@ export function RegisterSettingsPanel({
                 disabled={running}
                 value={config.proxy || ""}
                 onChange={(event) => onPatch({ proxy: event.target.value })}
-                placeholder="留空表示不单独指定"
+                placeholder="留空继承全局代理"
               />
             </Field>
           )}
@@ -103,10 +103,20 @@ export function RegisterSettingsPanel({
                   disabled={running}
                   value={config.proxy || ""}
                   onChange={(event) => onPatch({ proxy: event.target.value })}
-                  placeholder="留空表示不单独指定"
+                  placeholder="留空继承全局代理"
                 />
               </Field>
             ) : null}
+
+            <Field label="429 冷却时间（秒）">
+              <Input
+                disabled={running}
+                type="number"
+                min="60"
+                value={String(config.rate_limit_cooldown_seconds || 900)}
+                onChange={(event) => onPatch({ rate_limit_cooldown_seconds: Number(event.target.value) })}
+              />
+            </Field>
 
             <Field label="邮箱请求超时（秒）">
               <Input
