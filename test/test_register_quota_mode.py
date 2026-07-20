@@ -180,6 +180,32 @@ class RegisterServiceSourceCompatTests(unittest.TestCase):
             self.assertEqual(call_count, 3)
             self.assertEqual(service._config["stats"]["success"], 3)
 
+    def test_registration_disallowed_stops_after_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store_file = Path(tmp_dir) / "register.json"
+            service = RegisterService(store_file)
+            service._pool_metrics = lambda **_kwargs: self._metrics()
+            service._config.update({
+                "enabled": True,
+                "mode": "total",
+                "total": 10,
+                "threads": 3,
+            })
+
+            with patch(
+                "services.register_service.openai_register.worker",
+                return_value={"ok": False, "failure_kind": "registration_disallowed", "status_code": 400},
+            ) as worker:
+                service._run()
+
+            self.assertEqual(worker.call_count, 1)
+            self.assertFalse(service._config["enabled"])
+            self.assertEqual(service._config["stats"]["fail"], 1)
+            self.assertIn("registration_disallowed", service._config["stats"]["stop_reason"])
+            persisted = RegisterService(store_file).get()
+            self.assertFalse(persisted["enabled"])
+            self.assertIn("registration_disallowed", persisted["stats"]["stop_reason"])
+
     def test_rate_limit_recovery_uses_one_worker_until_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             service = RegisterService(Path(tmp_dir) / "register.json")

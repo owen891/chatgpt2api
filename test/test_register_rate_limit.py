@@ -20,6 +20,17 @@ class RegistrationRateLimitTests(unittest.TestCase):
         self.assertEqual(metadata["failure_kind"], "rate_limit")
         self.assertEqual(metadata["status_code"], 429)
 
+    def test_registration_disallowed_response_is_terminal(self) -> None:
+        metadata = _registration_failure_metadata(
+            RegistrationHTTPError(
+                'create_account_http_400 detail={"error":{"code":"registration_disallowed"}}',
+                status_code=400,
+            )
+        )
+
+        self.assertEqual(metadata["failure_kind"], "registration_disallowed")
+        self.assertEqual(metadata["status_code"], 400)
+
 
 if __name__ == "__main__":
     unittest.main()

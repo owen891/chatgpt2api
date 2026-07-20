@@ -158,6 +158,9 @@ def _registration_failure_metadata(error: Exception) -> dict[str, object]:
     if status_code == 429 or "rate_limit_exceeded" in message.lower():
         status_code = 429
         failure_kind = "rate_limit"
+    elif "registration_disallowed" in message.lower():
+        status_code = status_code or 400
+        failure_kind = "registration_disallowed"
     metadata: dict[str, object] = {"failure_kind": failure_kind or "registration_error"}
     if status_code:
         metadata["status_code"] = status_code

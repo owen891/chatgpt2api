@@ -2,6 +2,8 @@
 
 ## Unreleased
 
++ [Fix] Treat upstream `registration_disallowed` responses as terminal registration failures; stop after the probe instead of consuming the remaining mailbox pool.
+
 ## 1.1.2 - 2026-07-17
 
 + [修复] 图片和缩略图地址显式支持 HEAD 请求，避免外部平台预检图片时被前端兜底页错误响应为 HTML。

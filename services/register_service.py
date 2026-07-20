@@ -453,6 +453,19 @@ class RegisterService:
                             rate_limit_recovery = True
                             rate_limit_pending = True
                             rate_limit_retry_after = max(rate_limit_retry_after, int(result.get("retry_after") or 0))
+                        elif str(result.get("failure_kind") or "") == "registration_disallowed":
+                            reason = (
+                                "上游拒绝创建账号（registration_disallowed），注册任务已自动停止；"
+                                "请调整合规的注册环境后手动重试"
+                            )
+                            with self._lock:
+                                self._config["enabled"] = False
+                                self._config["stats"]["phase"] = "stopped"
+                                self._config["stats"]["stop_reason"] = reason
+                                self._config["stats"]["next_check_at"] = ""
+                                self._config["stats"]["updated_at"] = _now()
+                                self._save()
+                            self._append_log(reason, "red")
                         else:
                             probe_pending = False
                     except Exception:
